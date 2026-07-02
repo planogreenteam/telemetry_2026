@@ -25,9 +25,24 @@ def send_failed(lines):
     return any(marker in line for line in upper_lines for marker in SEND_FAILURE_MARKERS)
 
 
-def read_available_lines(ser, settle_time=0.2):
+def read_available_lines(ser, settle_time=0.2, quiet_gap=0.05, max_wait=1.5):
+    # Poll until the serial buffer goes quiet (no new bytes for `quiet_gap`
+    # seconds) or `max_wait` is hit, instead of a single fixed-length sleep.
+    # A bursty/slow modem write can otherwise get sliced mid-packet if the
+    # second burst arrives just after a one-shot read_all().
     time.sleep(settle_time)
-    raw = ser.read_all().decode(errors="ignore")
+    buf = bytearray()
+    start = last_data = time.monotonic()
+    while True:
+        chunk = ser.read_all()
+        if chunk:
+            buf.extend(chunk)
+            last_data = time.monotonic()
+        now = time.monotonic()
+        if now - last_data > quiet_gap or now - start > max_wait:
+            break
+        time.sleep(0.01)
+    raw = bytes(buf).decode(errors="ignore")
     if not raw:
         return []
     return [line.strip() for line in raw.replace("\r", "\n").split("\n") if line.strip()]
@@ -166,12 +181,12 @@ class LoRaTransport:
             raise RuntimeError(f"Receiver acknowledgement failed: {' | '.join(lines)}")
         return lines
 
-    def receive_hex_lines(self, recv_format=0, wait=0.3):
+    def receive_hex_lines(self, recv_format=0, wait=0.5):
         ser = self._require_serial()
         lines = require_ok(ser, f"AT+RECV={recv_format}", wait=wait, allow_empty=True)
         return [line for line in lines if line.strip().upper() not in IGNORED_RX_LINES]
 
-    def receive_packets(self, recv_format=0, wait=0.3):
+    def receive_packets(self, recv_format=0, wait=0.5):
         for line in self.receive_hex_lines(recv_format=recv_format, wait=wait):
             payload_hex = extract_hex_payload(line)
             if payload_hex:
@@ -189,7 +204,13 @@ class LoRaTransport:
 
 
 def extract_hex_payload(line):
-    hex_bytes = HEX_PATTERN.findall(line)
+    # Only look for hex bytes before the first comma. Modems append
+    # RSSI/SNR metadata after the payload separated by commas (e.g.
+    # "... d1 59 ,-33,13"), and without this the two-char tokens in
+    # "-33" and "13" get scooped up as bogus extra payload bytes,
+    # corrupting the packet and shifting where the CRC field is read from.
+    payload_part = line.split(",", 1)[0]
+    hex_bytes = HEX_PATTERN.findall(payload_part)
     if hex_bytes:
         candidate = "".join(hex_bytes)
         if len(candidate) % 2 == 0:
