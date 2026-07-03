@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import itertools
+import queue
 import sys
 import threading
 import time
@@ -42,9 +44,9 @@ DEFAULT_ACK = 0
 DEFAULT_RETRIES = 3
 
 DEFAULT_VOLTAGE_DELTA_MV = 50
-DEFAULT_CURRENT_DELTA_MA = 10
-DEFAULT_POWER_DELTA_W = 1
-DEFAULT_HEARTBEAT_SECONDS = 3
+DEFAULT_CURRENT_DELTA_MA = 200
+DEFAULT_POWER_DELTA_W = 5
+DEFAULT_HEARTBEAT_SECONDS = 20
 
 # CAN defaults
 DEFAULT_CAN_INTERFACE = "can0"
@@ -107,9 +109,10 @@ def _process_reading(components, raw_frame, transport, log_prefix):
         )
         return
 
+    priority = components.get("priority", PrioritySendTransport.LOW)
     try:
         t0 = time.time()
-        transport.send_hex(packet.hex())
+        transport.send_hex(packet.hex(), priority=priority)
         print(
             f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
             f"tx={time.time()-t0:.2f}s fields={reading['fields']}",
@@ -288,6 +291,7 @@ def build_bmv_sender_components(args):
         "device_id": args.device_id,
         "log_prefix": "bmv",
         "sink": sink,
+        "priority": PrioritySendTransport.HIGH,
     }
 
 
@@ -350,6 +354,7 @@ def build_can_sender_components(args):
                 "device_id": args.mppt_device_id,
                 "sink": mppt_sink,
                 "log_prefix": "mppt",
+                "priority": PrioritySendTransport.LOW,
             },
             "bms": {
                 "normalizer": normalize_bms_frame,
@@ -358,6 +363,7 @@ def build_can_sender_components(args):
                 "device_id": args.bms_device_id,
                 "sink": bms_sink,
                 "log_prefix": "bms",
+                "priority": PrioritySendTransport.LOW,
             },
         },
     }
@@ -373,15 +379,64 @@ SENDER_COMPONENT_BUILDERS = {
 # 'all' mode: probe hardware, run whatever's available
 # ─────────────────────────────────────────────────────────────────────────────
 
-class LockedTransport:
-    """Serialize send_hex across threads sharing one LoRa modem."""
+class PrioritySendTransport:
+    """Priority-aware serializer for a single shared LoRa modem.
+
+    Only one physical send can be in flight at a time (the modem write is
+    blocking), so this cannot interrupt a send that has already started.
+    What it guarantees is queue ordering: if a HIGH-priority send (BMV,
+    e.g. current draw) and one or more LOW-priority sends (MPPT/BMS) are
+    both waiting when the modem becomes free, the HIGH-priority send goes
+    next — it never waits behind a backlog of LOW-priority sends.
+
+    A single dedicated worker thread owns the modem and is the only
+    caller of the wrapped transport's send_hex(), so this also replaces
+    the old plain-mutex LockedTransport (the queue itself serializes
+    access; no separate lock is needed).
+    """
+
+    HIGH = 0
+    LOW = 1
+
     def __init__(self, inner):
         self._inner = inner
-        self._lock = threading.Lock()
+        self._queue = queue.PriorityQueue()
+        self._counter = itertools.count()
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._run, name="lora-send-worker", daemon=True
+        )
+        self._worker.start()
 
-    def send_hex(self, hex_str):
-        with self._lock:
-            return self._inner.send_hex(hex_str)
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                priority, _, payload_hex, result, done = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                result["lines"] = self._inner.send_hex(payload_hex)
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                done.set()
+
+    def send_hex(self, hex_str, priority=LOW):
+        result = {}
+        done = threading.Event()
+        # Monotonic counter as a tiebreaker so PriorityQueue never has to
+        # compare the dict/Event payloads, and so same-priority sends stay
+        # in FIFO order.
+        seq = next(self._counter)
+        self._queue.put((priority, seq, hex_str, result, done))
+        done.wait()
+        if "error" in result:
+            raise result["error"]
+        return result.get("lines")
+
+    def close(self):
+        self._stop_event.set()
+        self._worker.join(timeout=2.0)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -558,12 +613,16 @@ def main(argv=None):
         raise ValueError(f"Unsupported transport {args.transport}")
 
     with build_lora_transport(args) as transport:
-        if is_all_mode:
-            _run_all(args, LockedTransport(transport))
-        elif args.device == "can":
-            run_can_sender(**components, transport=transport)
-        else:
-            run_sender(**components, transport=transport)
+        priority_transport = PrioritySendTransport(transport)
+        try:
+            if is_all_mode:
+                _run_all(args, priority_transport)
+            elif args.device == "can":
+                run_can_sender(**components, transport=priority_transport)
+            else:
+                run_sender(**components, transport=priority_transport)
+        finally:
+            priority_transport.close()
 
 
 if __name__ == "__main__":
