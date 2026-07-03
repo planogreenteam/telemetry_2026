@@ -51,6 +51,7 @@ class BMVField(IntEnum):
     POWER_W      = 1 << 2
     CHARGE_STATE = 1 << 3
     ALARM        = 1 << 4
+    ELAPSED_S    = 1 << 5
 
 
 BMV_FIELD_LAYOUT = (
@@ -59,6 +60,7 @@ BMV_FIELD_LAYOUT = (
     (BMVField.POWER_W,      "power_w",      ">h"),
     (BMVField.CHARGE_STATE, "charge_state", ">B"),
     (BMVField.ALARM,        "alarm",        ">B"),
+    (BMVField.ELAPSED_S,    "elapsed_s",    ">I"),
 )
 
 
@@ -80,6 +82,7 @@ class MPPTField(IntEnum):
     HEATSINK_TEMP_C   = 1 << 9
     MPPT_INDEX        = 1 << 10
     PACKET_ID         = 1 << 11
+    ELAPSED_S         = 1 << 12
 
 
 MPPT_FIELD_LAYOUT = (
@@ -95,6 +98,7 @@ MPPT_FIELD_LAYOUT = (
     (MPPTField.HEATSINK_TEMP_C,   "heatsink_temp_c",   ">b"),
     (MPPTField.MPPT_INDEX,        "mppt_index",        ">B"),
     (MPPTField.PACKET_ID,         "packet_id",         ">B"),
+    (MPPTField.ELAPSED_S,         "elapsed_s",         ">I"),
 )
 
 
@@ -117,6 +121,7 @@ class BMSField(IntEnum):
     MODULE_COUNT        = 1 << 11
     CHARGE_ENABLE       = 1 << 12
     DISCHARGE_ENABLE    = 1 << 13
+    ELAPSED_S           = 1 << 14
 
 
 BMS_FIELD_LAYOUT = (
@@ -134,6 +139,7 @@ BMS_FIELD_LAYOUT = (
     (BMSField.MODULE_COUNT,        "module_count",        ">B"),
     (BMSField.CHARGE_ENABLE,       "charge_enable",       ">B"),
     (BMSField.DISCHARGE_ENABLE,    "discharge_enable",    ">B"),
+    (BMSField.ELAPSED_S,           "elapsed_s",           ">I"),
 )
 
 
@@ -162,6 +168,7 @@ _PACK_SCALES = {
     "module_count":         1,
     "charge_enable":        1,
     "discharge_enable":     1,
+    "elapsed_s":            1,
 }
 
 _LAYOUTS = {
