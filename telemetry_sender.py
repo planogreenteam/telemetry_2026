@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import itertools
-import queue
 import sys
 import threading
 import time
@@ -18,6 +16,30 @@ from BMV.bmv_reader import BMVReader
 from LORA.lora_transport import LoRaTransport
 from storage.csv_sink import write_telemetry_csv
 from telemetry_packet import build_bmv_packet
+
+
+class DriveStopwatch:
+    """Starts the first time current draw is seen nonzero from *either* BMV
+    or BMS, then keeps running for the life of the process (i.e. until the
+    Pi shuts down). Shared across streams via a single module-level instance.
+    """
+    def __init__(self, zero_threshold: float = 0.0):
+        self.zero_threshold = zero_threshold
+        self._start = None
+
+    def update(self, current_value) -> None:
+        if self._start is None and current_value is not None and abs(current_value) > self.zero_threshold:
+            self._start = time.monotonic()
+            print(f"[drive-timer] Current draw detected, timer started", flush=True)
+
+    def elapsed(self) -> float:
+        if self._start is None:
+            return 0.0
+        return round(time.monotonic() - self._start, 1)
+
+
+# Shared across BMV and CAN(BMS) streams, whichever trips first wins.
+_drive_stopwatch = DriveStopwatch()
 
 
 DEFAULT_DEVICE = "all"
@@ -43,10 +65,34 @@ DEFAULT_GROUP = 0
 DEFAULT_ACK = 0
 DEFAULT_RETRIES = 3
 
-DEFAULT_VOLTAGE_DELTA_MV = 50
-DEFAULT_CURRENT_DELTA_MA = 200
-DEFAULT_POWER_DELTA_W = 5
-DEFAULT_HEARTBEAT_SECONDS = 20
+DEFAULT_VOLTAGE_DELTA_MV = 1
+DEFAULT_CURRENT_DELTA_MA = 10
+DEFAULT_POWER_DELTA_W = 1
+DEFAULT_HEARTBEAT_SECONDS = 3
+
+
+class DriveStopwatch:
+    """Elapsed-time clock for a drive.
+
+    Stays at 0 until BMV current draw first moves off 0.00 mA, then runs
+    continuously (using a monotonic clock, so it's immune to system clock
+    changes) until the process exits — i.e. until the Pi turns off.
+    """
+
+    def __init__(self, zero_threshold_ma: float = 0.0):
+        self.zero_threshold_ma = zero_threshold_ma
+        self._start = None
+
+    def update(self, current_ma) -> float:
+        if self._start is None and current_ma is not None and abs(current_ma) > self.zero_threshold_ma:
+            self._start = time.monotonic()
+            print(f"[bmv] Drive started (current_ma={current_ma}) - timer running", flush=True)
+        return self.elapsed()
+
+    def elapsed(self) -> float:
+        if self._start is None:
+            return 0.0
+        return round(time.monotonic() - self._start, 1)
 
 # CAN defaults
 DEFAULT_CAN_INTERFACE = "can0"
@@ -109,10 +155,9 @@ def _process_reading(components, raw_frame, transport, log_prefix):
         )
         return
 
-    priority = components.get("priority", PrioritySendTransport.LOW)
     try:
         t0 = time.time()
-        transport.send_hex(packet.hex(), priority=priority)
+        transport.send_hex(packet.hex())
         print(
             f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
             f"tx={time.time()-t0:.2f}s fields={reading['fields']}",
@@ -282,7 +327,11 @@ def build_bmv_sender_components(args):
         power_delta_w=args.power_delta_w,
         heartbeat_seconds=args.heartbeat_seconds,
     )
-    sink = lambda reading: write_telemetry_csv(args.csv_path, reading)
+    def bmv_sink(reading):
+        _drive_stopwatch.update(reading["fields"].get("current_ma"))
+        reading["fields"]["elapsed_s"] = _drive_stopwatch.elapsed()
+        write_telemetry_csv(args.csv_path, reading)
+
     return {
         "reader": reader,
         "normalizer": normalize_bmv_frame,
@@ -290,8 +339,7 @@ def build_bmv_sender_components(args):
         "packet_builder": build_bmv_packet,
         "device_id": args.device_id,
         "log_prefix": "bmv",
-        "sink": sink,
-        "priority": PrioritySendTransport.HIGH,
+        "sink": bmv_sink,
     }
 
 
@@ -340,8 +388,14 @@ def build_can_sender_components(args):
         heartbeat_seconds=args.bms_heartbeat_seconds,
     )
 
-    mppt_sink = lambda r: write_telemetry_csv(args.csv_path_mppt, r)
-    bms_sink = lambda r: write_telemetry_csv(args.csv_path_bms, r)
+    def mppt_sink(r):
+        r["fields"]["elapsed_s"] = _drive_stopwatch.elapsed()
+        write_telemetry_csv(args.csv_path_mppt, r)
+
+    def bms_sink(r):
+        _drive_stopwatch.update(r["fields"].get("battery_current_a"))
+        r["fields"]["elapsed_s"] = _drive_stopwatch.elapsed()
+        write_telemetry_csv(args.csv_path_bms, r)
 
     return {
         "reader": reader,
@@ -354,7 +408,6 @@ def build_can_sender_components(args):
                 "device_id": args.mppt_device_id,
                 "sink": mppt_sink,
                 "log_prefix": "mppt",
-                "priority": PrioritySendTransport.LOW,
             },
             "bms": {
                 "normalizer": normalize_bms_frame,
@@ -363,7 +416,6 @@ def build_can_sender_components(args):
                 "device_id": args.bms_device_id,
                 "sink": bms_sink,
                 "log_prefix": "bms",
-                "priority": PrioritySendTransport.LOW,
             },
         },
     }
@@ -379,64 +431,15 @@ SENDER_COMPONENT_BUILDERS = {
 # 'all' mode: probe hardware, run whatever's available
 # ─────────────────────────────────────────────────────────────────────────────
 
-class PrioritySendTransport:
-    """Priority-aware serializer for a single shared LoRa modem.
-
-    Only one physical send can be in flight at a time (the modem write is
-    blocking), so this cannot interrupt a send that has already started.
-    What it guarantees is queue ordering: if a HIGH-priority send (BMV,
-    e.g. current draw) and one or more LOW-priority sends (MPPT/BMS) are
-    both waiting when the modem becomes free, the HIGH-priority send goes
-    next — it never waits behind a backlog of LOW-priority sends.
-
-    A single dedicated worker thread owns the modem and is the only
-    caller of the wrapped transport's send_hex(), so this also replaces
-    the old plain-mutex LockedTransport (the queue itself serializes
-    access; no separate lock is needed).
-    """
-
-    HIGH = 0
-    LOW = 1
-
+class LockedTransport:
+    """Serialize send_hex across threads sharing one LoRa modem."""
     def __init__(self, inner):
         self._inner = inner
-        self._queue = queue.PriorityQueue()
-        self._counter = itertools.count()
-        self._stop_event = threading.Event()
-        self._worker = threading.Thread(
-            target=self._run, name="lora-send-worker", daemon=True
-        )
-        self._worker.start()
+        self._lock = threading.Lock()
 
-    def _run(self):
-        while not self._stop_event.is_set():
-            try:
-                priority, _, payload_hex, result, done = self._queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            try:
-                result["lines"] = self._inner.send_hex(payload_hex)
-            except Exception as exc:
-                result["error"] = exc
-            finally:
-                done.set()
-
-    def send_hex(self, hex_str, priority=LOW):
-        result = {}
-        done = threading.Event()
-        # Monotonic counter as a tiebreaker so PriorityQueue never has to
-        # compare the dict/Event payloads, and so same-priority sends stay
-        # in FIFO order.
-        seq = next(self._counter)
-        self._queue.put((priority, seq, hex_str, result, done))
-        done.wait()
-        if "error" in result:
-            raise result["error"]
-        return result.get("lines")
-
-    def close(self):
-        self._stop_event.set()
-        self._worker.join(timeout=2.0)
+    def send_hex(self, hex_str):
+        with self._lock:
+            return self._inner.send_hex(hex_str)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -613,16 +616,12 @@ def main(argv=None):
         raise ValueError(f"Unsupported transport {args.transport}")
 
     with build_lora_transport(args) as transport:
-        priority_transport = PrioritySendTransport(transport)
-        try:
-            if is_all_mode:
-                _run_all(args, priority_transport)
-            elif args.device == "can":
-                run_can_sender(**components, transport=priority_transport)
-            else:
-                run_sender(**components, transport=priority_transport)
-        finally:
-            priority_transport.close()
+        if is_all_mode:
+            _run_all(args, LockedTransport(transport))
+        elif args.device == "can":
+            run_can_sender(**components, transport=transport)
+        else:
+            run_sender(**components, transport=transport)
 
 
 if __name__ == "__main__":
