@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import heapq
+import itertools
 import sys
 import threading
 import time
@@ -16,30 +18,6 @@ from BMV.bmv_reader import BMVReader
 from LORA.lora_transport import LoRaTransport
 from storage.csv_sink import write_telemetry_csv
 from telemetry_packet import build_bmv_packet
-
-
-class DriveStopwatch:
-    """Starts the first time current draw is seen nonzero from *either* BMV
-    or BMS, then keeps running for the life of the process (i.e. until the
-    Pi shuts down). Shared across streams via a single module-level instance.
-    """
-    def __init__(self, zero_threshold: float = 0.0):
-        self.zero_threshold = zero_threshold
-        self._start = None
-
-    def update(self, current_value) -> None:
-        if self._start is None and current_value is not None and abs(current_value) > self.zero_threshold:
-            self._start = time.monotonic()
-            print(f"[drive-timer] Current draw detected, timer started", flush=True)
-
-    def elapsed(self) -> float:
-        if self._start is None:
-            return 0.0
-        return round(time.monotonic() - self._start, 1)
-
-
-# Shared across BMV and CAN(BMS) streams, whichever trips first wins.
-_drive_stopwatch = DriveStopwatch()
 
 
 DEFAULT_DEVICE = "all"
@@ -70,30 +48,6 @@ DEFAULT_CURRENT_DELTA_MA = 10
 DEFAULT_POWER_DELTA_W = 1
 DEFAULT_HEARTBEAT_SECONDS = 3
 
-
-class DriveStopwatch:
-    """Elapsed-time clock for a drive.
-
-    Stays at 0 until BMV current draw first moves off 0.00 mA, then runs
-    continuously (using a monotonic clock, so it's immune to system clock
-    changes) until the process exits — i.e. until the Pi turns off.
-    """
-
-    def __init__(self, zero_threshold_ma: float = 0.0):
-        self.zero_threshold_ma = zero_threshold_ma
-        self._start = None
-
-    def update(self, current_ma) -> float:
-        if self._start is None and current_ma is not None and abs(current_ma) > self.zero_threshold_ma:
-            self._start = time.monotonic()
-            print(f"[bmv] Drive started (current_ma={current_ma}) - timer running", flush=True)
-        return self.elapsed()
-
-    def elapsed(self) -> float:
-        if self._start is None:
-            return 0.0
-        return round(time.monotonic() - self._start, 1)
-
 # CAN defaults
 DEFAULT_CAN_INTERFACE = "can0"
 DEFAULT_CAN_BITRATE = 500000
@@ -111,6 +65,28 @@ DEFAULT_NUM_MPPTS = 6
 CAN_SAMPLE_INTERVAL = 0.0
 STATUS_TICKS = 15  # transmit status frames at most once per 5 × 1s = 5s
 
+# Cap how many CAN packets the transmit thread will push out in a single
+# tick. Without this, a correlated event (e.g. sharp acceleration moving
+# voltage/current on every MPPT + the BMS at once) can queue up a dozen-plus
+# sends back to back, monopolizing the shared LoRa modem for several
+# seconds and starving higher-priority BMV sends even with a priority lock
+# in place (priority only lets BMV jump the queue *between* sends, not
+# preempt one in flight). Capping the burst size spreads it across more
+# ticks so the modem is never held for more than a few sends at a time.
+# Anything left over just gets re-evaluated (and is still "due") next tick.
+MAX_CAN_SENDS_PER_TICK = 3
+
+# send_hex priority values — lower number = served first when multiple
+# threads are waiting on PriorityLockedTransport. BMV carries the peak
+# current draw we care about most, so it always jumps ahead of queued CAN
+# sends.
+PRIORITY_BMV = 0
+PRIORITY_CAN = 10
+
+# How often the BMV cached-sender's transmit thread wakes to check the
+# latest cached VE.Direct reading and decide whether to send.
+BMV_SAMPLE_INTERVAL = 0.1
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE LOOP — BMV single-stream sender (unchanged)
@@ -123,6 +99,7 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     device_id = components["device_id"]
     sink = components.get("sink")
     sub_prefix = components.get("log_prefix", log_prefix)
+    priority = components.get("priority", PRIORITY_CAN)
 
     try:
         reading = normalizer(raw_frame, device_id)
@@ -157,7 +134,11 @@ def _process_reading(components, raw_frame, transport, log_prefix):
 
     try:
         t0 = time.time()
-        transport.send_hex(packet.hex())
+        try:
+            transport.send_hex(packet.hex(), priority=priority)
+        except TypeError:
+            # Plain (non-priority-aware) transports don't accept priority.
+            transport.send_hex(packet.hex())
         print(
             f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
             f"tx={time.time()-t0:.2f}s fields={reading['fields']}",
@@ -179,8 +160,11 @@ def run_sender(
     log_prefix="telemetry",
     sink=None,
     transport=None,
+    priority=PRIORITY_BMV,
 ):
-    """Single-stream (BMV) sender loop."""
+    """Single-stream (BMV) sender loop. Kept for --dry-run (no transport
+    contention to worry about there); live runs use run_bmv_cached_sender
+    instead — see main()."""
     if streams is not None:
         raise ValueError(
             "run_sender no longer handles multi-stream CAN — use run_can_sender instead."
@@ -197,6 +181,7 @@ def run_sender(
         "device_id": device_id,
         "sink": sink,
         "log_prefix": log_prefix,
+        "priority": priority,
     }
 
     print(f"[{log_prefix}] Starting sender loop", flush=True)
@@ -254,7 +239,14 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                 with cache_lock:
                     snapshot = dict(cache)
 
+                sent_this_tick = 0
                 for (kind, can_id), raw_frame in snapshot.items():
+                    if sent_this_tick >= MAX_CAN_SENDS_PER_TICK:
+                        # Leave the rest in the cache — they're still "due"
+                        # per policy.classify() and will be picked up next
+                        # tick instead of monopolizing the modem in one burst.
+                        break
+
                     comps = streams.get(kind)
                     if comps is None:
                         continue
@@ -266,6 +258,7 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                         continue
 
                     _process_reading(comps, raw_frame, transport, log_prefix)
+                    sent_this_tick += 1
                     time.sleep(0.0)  # give modem time to recover between sends
 
         except Exception as exc:
@@ -279,6 +272,99 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
             f"policy={type(comps['policy']).__name__}",
             flush=True,
         )
+
+    rt = threading.Thread(target=_reader_thread, name=f"{log_prefix}-reader", daemon=True)
+    tt = threading.Thread(target=_transmit_thread, name=f"{log_prefix}-tx", daemon=True)
+    rt.start()
+    tt.start()
+
+    try:
+        while rt.is_alive() and tt.is_alive():
+            rt.join(timeout=0.5)
+            tt.join(timeout=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BMV SENDER — latest-value cache architecture (mirrors run_can_sender)
+#
+# The old single-threaded run_sender() blocks on reader.read_frame() and
+# then calls transport.send_hex() inline. If the shared LoRa modem is busy
+# (e.g. a correlated CAN burst holding the lock), that call blocks — and
+# because reading and sending happen in the same thread, BMV can't advance
+# to a fresher VE.Direct frame while it waits. The result: during a sharp
+# acceleration event (which tends to move voltage/current across every
+# MPPT + the BMS at once, triggering a burst of CAN sends), BMV can go
+# dark for as long as the whole burst takes to drain, and the frame it
+# finally sends afterward is stale rather than the peak-current sample.
+#
+# This version decouples reading from sending exactly like run_can_sender:
+# a reader thread continuously updates a single-slot cache with the latest
+# VE.Direct frame, and a transmit thread wakes on its own schedule, checks
+# whatever is currently cached, and sends it if policy.classify() says to.
+# Whenever the modem becomes free, BMV always sends the freshest state
+# rather than working through a backlog of stale readings.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_bmv_cached_sender(
+    *,
+    reader,
+    normalizer,
+    policy,
+    packet_builder,
+    device_id,
+    transport,
+    sink=None,
+    log_prefix="bmv",
+    sample_interval=BMV_SAMPLE_INTERVAL,
+    priority=PRIORITY_BMV,
+):
+    """BMV sender using a latest-value cache + timed TX thread, so a busy
+    shared modem never delays BMV by more than one send, and BMV always
+    transmits its freshest reading rather than a stale queued one."""
+
+    cache = {}
+    cache_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    components = {
+        "normalizer": normalizer,
+        "policy": policy,
+        "packet_builder": packet_builder,
+        "device_id": device_id,
+        "sink": sink,
+        "log_prefix": log_prefix,
+        "priority": priority,
+    }
+
+    def _reader_thread():
+        try:
+            while not stop_event.is_set():
+                raw_frame = reader.read_frame()
+                if raw_frame is None:
+                    continue
+                with cache_lock:
+                    cache["latest"] = raw_frame
+        except Exception as exc:
+            print(f"[{log_prefix}] Reader thread crashed: {exc}", flush=True)
+        finally:
+            reader.close()
+
+    def _transmit_thread():
+        try:
+            while not stop_event.is_set():
+                time.sleep(sample_interval)
+                with cache_lock:
+                    raw_frame = cache.get("latest")
+                if raw_frame is not None:
+                    _process_reading(components, raw_frame, transport, log_prefix)
+        except Exception as exc:
+            print(f"[{log_prefix}] Transmit thread crashed: {exc}", flush=True)
+
+    print(f"[{log_prefix}] Starting BMV sender (cache+timer architecture)", flush=True)
 
     rt = threading.Thread(target=_reader_thread, name=f"{log_prefix}-reader", daemon=True)
     tt = threading.Thread(target=_transmit_thread, name=f"{log_prefix}-tx", daemon=True)
@@ -327,11 +413,7 @@ def build_bmv_sender_components(args):
         power_delta_w=args.power_delta_w,
         heartbeat_seconds=args.heartbeat_seconds,
     )
-    def bmv_sink(reading):
-        _drive_stopwatch.update(reading["fields"].get("current_ma"))
-        reading["fields"]["elapsed_s"] = _drive_stopwatch.elapsed()
-        write_telemetry_csv(args.csv_path, reading)
-
+    sink = lambda reading: write_telemetry_csv(args.csv_path, reading)
     return {
         "reader": reader,
         "normalizer": normalize_bmv_frame,
@@ -339,7 +421,8 @@ def build_bmv_sender_components(args):
         "packet_builder": build_bmv_packet,
         "device_id": args.device_id,
         "log_prefix": "bmv",
-        "sink": bmv_sink,
+        "sink": sink,
+        "priority": PRIORITY_BMV,
     }
 
 
@@ -388,14 +471,8 @@ def build_can_sender_components(args):
         heartbeat_seconds=args.bms_heartbeat_seconds,
     )
 
-    def mppt_sink(r):
-        r["fields"]["elapsed_s"] = _drive_stopwatch.elapsed()
-        write_telemetry_csv(args.csv_path_mppt, r)
-
-    def bms_sink(r):
-        _drive_stopwatch.update(r["fields"].get("battery_current_a"))
-        r["fields"]["elapsed_s"] = _drive_stopwatch.elapsed()
-        write_telemetry_csv(args.csv_path_bms, r)
+    mppt_sink = lambda r: write_telemetry_csv(args.csv_path_mppt, r)
+    bms_sink = lambda r: write_telemetry_csv(args.csv_path_bms, r)
 
     return {
         "reader": reader,
@@ -408,6 +485,7 @@ def build_can_sender_components(args):
                 "device_id": args.mppt_device_id,
                 "sink": mppt_sink,
                 "log_prefix": "mppt",
+                "priority": PRIORITY_CAN,
             },
             "bms": {
                 "normalizer": normalize_bms_frame,
@@ -416,6 +494,7 @@ def build_can_sender_components(args):
                 "device_id": args.bms_device_id,
                 "sink": bms_sink,
                 "log_prefix": "bms",
+                "priority": PRIORITY_CAN,
             },
         },
     }
@@ -432,14 +511,64 @@ SENDER_COMPONENT_BUILDERS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LockedTransport:
-    """Serialize send_hex across threads sharing one LoRa modem."""
+    """Serialize send_hex across threads sharing one LoRa modem.
+
+    Plain FIFO — kept for backwards compatibility with any external code
+    importing it directly. New code should use PriorityLockedTransport,
+    which is what telemetry_sender wires up itself (see main()), so that a
+    burst of low-priority CAN sends can't starve high-priority BMV sends.
+    """
     def __init__(self, inner):
         self._inner = inner
         self._lock = threading.Lock()
 
-    def send_hex(self, hex_str):
+    def send_hex(self, hex_str, priority=None):
         with self._lock:
             return self._inner.send_hex(hex_str)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class PriorityLockedTransport:
+    """Serialize send_hex across threads sharing one LoRa modem, but let
+    high-priority callers (BMV) jump ahead of already-queued lower-priority
+    callers (CAN) that are still waiting for their turn.
+
+    This does NOT preempt a send that's already in flight — the modem can
+    only do one AT+SEND at a time — but it guarantees that once the current
+    send finishes, the next one to go is the highest-priority one waiting,
+    not simply whoever queued up first. Combined with MAX_CAN_SENDS_PER_TICK
+    (which limits how many CAN sends can even be queued back-to-back), this
+    bounds the worst-case delay for a BMV send to roughly one in-flight
+    send's duration, instead of an entire correlated CAN burst.
+
+    Lower `priority` value = served first. Ties broken FIFO via an
+    increasing counter.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._cv = threading.Condition()
+        self._counter = itertools.count()
+        self._waiting = []  # heap of [priority, seq] tickets
+        self._busy = False
+
+    def send_hex(self, hex_str, priority=PRIORITY_CAN):
+        ticket = [priority, next(self._counter)]
+        with self._cv:
+            heapq.heappush(self._waiting, ticket)
+            while self._busy or self._waiting[0] is not ticket:
+                self._cv.wait()
+            self._busy = True
+            self._waiting.remove(ticket)
+            heapq.heapify(self._waiting)
+        try:
+            return self._inner.send_hex(hex_str)
+        finally:
+            with self._cv:
+                self._busy = False
+                self._cv.notify_all()
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -546,7 +675,7 @@ def build_parser():
 def _run_bmv_in_thread(components, transport):
     def _target():
         try:
-            run_sender(**components, transport=transport)
+            run_bmv_cached_sender(**components, transport=transport)
         except Exception as exc:
             print(f"[bmv] thread crashed: {exc}", flush=True)
 
@@ -617,11 +746,16 @@ def main(argv=None):
 
     with build_lora_transport(args) as transport:
         if is_all_mode:
-            _run_all(args, LockedTransport(transport))
+            _run_all(args, PriorityLockedTransport(transport))
         elif args.device == "can":
             run_can_sender(**components, transport=transport)
         else:
-            run_sender(**components, transport=transport)
+            # Standalone --device bmv: still use the cache+timer sender so a
+            # single slow/blocked send_hex() can't stall reading of the next
+            # (potentially peak-current) VE.Direct frame. Priority is a
+            # no-op here since BMV is the only thing on the modem, but it
+            # keeps the code path identical to 'all' mode.
+            run_bmv_cached_sender(**components, transport=transport)
 
 
 if __name__ == "__main__":
