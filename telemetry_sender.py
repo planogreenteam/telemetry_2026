@@ -5,6 +5,7 @@ import itertools
 import sys
 import threading
 import time
+import traceback
 
 # Make stdout line-buffered so logs appear immediately on Windows / piped runs.
 try:
@@ -103,8 +104,8 @@ def _process_reading(components, raw_frame, transport, log_prefix):
 
     try:
         reading = normalizer(raw_frame, device_id)
-    except Exception as exc:
-        print(f"[{sub_prefix}] Normalize failed: {exc}", flush=True)
+    except Exception:
+        print(f"[{sub_prefix}] Normalize failed:\n{traceback.format_exc()}", flush=True)
         return
 
     if sink is not None:
@@ -120,8 +121,8 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     seq = policy.mark_sent(reading)
     try:
         packet = packet_builder(reading, event_type, seq)
-    except Exception as exc:
-        print(f"[{sub_prefix}] Packet build failed: {exc}", flush=True)
+    except Exception:
+        print(f"[{sub_prefix}] Packet build failed:\n{traceback.format_exc()}", flush=True)
         return
 
     if transport is None:
@@ -144,8 +145,8 @@ def _process_reading(components, raw_frame, transport, log_prefix):
             f"tx={time.time()-t0:.2f}s fields={reading['fields']}",
             flush=True,
         )
-    except Exception as exc:
-        print(f"[{sub_prefix}] Transport send failed: {exc}", flush=True)
+    except Exception:
+        print(f"[{sub_prefix}] Transport send failed:\n{traceback.format_exc()}", flush=True)
         return
 
 
@@ -224,8 +225,8 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                 can_id = raw_frame.get("can_id")
                 with cache_lock:
                     cache[(kind, can_id)] = raw_frame
-        except Exception as exc:
-            print(f"[{log_prefix}] Reader thread crashed: {exc}", flush=True)
+        except Exception:
+            print(f"[{log_prefix}] Reader thread crashed:\n{traceback.format_exc()}", flush=True)
         finally:
             reader.close()
 
@@ -285,8 +286,8 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
 
                 rr_start = idx  # next tick picks up where this one left off
 
-        except Exception as exc:
-            print(f"[{log_prefix}] Transmit thread crashed: {exc}", flush=True)
+        except Exception:
+            print(f"[{log_prefix}] Transmit thread crashed:\n{traceback.format_exc()}", flush=True)
 
     print(f"[{log_prefix}] Starting CAN sender (cache+timer architecture)", flush=True)
     for kind, comps in streams.items():
@@ -365,28 +366,58 @@ def run_bmv_cached_sender(
     }
 
     def _reader_thread():
+        got_first_frame = False
+        last_report = time.monotonic()
         try:
             while not stop_event.is_set():
                 raw_frame = reader.read_frame()
                 if raw_frame is None:
+                    now = time.monotonic()
+                    if now - last_report >= 5.0:
+                        print(f"[{log_prefix}] Reader alive, still waiting for a "
+                              f"complete VE.Direct frame (read_frame() returned None)",
+                              flush=True)
+                        last_report = now
                     continue
+                if not got_first_frame:
+                    print(f"[{log_prefix}] First VE.Direct frame received: "
+                          f"{raw_frame}", flush=True)
+                    got_first_frame = True
                 with cache_lock:
                     cache["latest"] = raw_frame
-        except Exception as exc:
-            print(f"[{log_prefix}] Reader thread crashed: {exc}", flush=True)
+        except Exception:
+            print(f"[{log_prefix}] Reader thread crashed:\n{traceback.format_exc()}",
+                  flush=True)
         finally:
             reader.close()
 
     def _transmit_thread():
+        checks = 0
+        sends = 0
+        last_report = time.monotonic()
         try:
             while not stop_event.is_set():
                 time.sleep(sample_interval)
                 with cache_lock:
                     raw_frame = cache.get("latest")
+                checks += 1
                 if raw_frame is not None:
+                    before = sends
                     _process_reading(components, raw_frame, transport, log_prefix)
-        except Exception as exc:
-            print(f"[{log_prefix}] Transmit thread crashed: {exc}", flush=True)
+                    # _process_reading itself prints "Sent ..." on success; we
+                    # can't easily tell from here whether it sent, so just
+                    # track that we attempted processing on real data.
+                now = time.monotonic()
+                if now - last_report >= 5.0:
+                    cache_state = "has data" if raw_frame is not None else "EMPTY"
+                    print(f"[{log_prefix}] Transmit thread alive: "
+                          f"{checks} cache checks in last interval, cache is {cache_state}",
+                          flush=True)
+                    last_report = now
+                    checks = 0
+        except Exception:
+            print(f"[{log_prefix}] Transmit thread crashed:\n{traceback.format_exc()}",
+                  flush=True)
 
     print(f"[{log_prefix}] Starting BMV sender (cache+timer architecture)", flush=True)
 
@@ -601,16 +632,16 @@ class PriorityLockedTransport:
 def _try_build_bmv_components(args):
     try:
         return build_bmv_sender_components(args)
-    except Exception as exc:
-        print(f"[all] BMV unavailable, skipping: {exc}", flush=True)
+    except Exception:
+        print(f"[all] BMV unavailable, skipping:\n{traceback.format_exc()}", flush=True)
         return None
 
 
 def _try_build_can_components(args):
     try:
         return build_can_sender_components(args)
-    except Exception as exc:
-        print(f"[all] CAN unavailable, skipping: {exc}", flush=True)
+    except Exception:
+        print(f"[all] CAN unavailable, skipping:\n{traceback.format_exc()}", flush=True)
         return None
 
 
@@ -700,8 +731,8 @@ def _run_bmv_in_thread(components, transport):
     def _target():
         try:
             run_bmv_cached_sender(**components, transport=transport)
-        except Exception as exc:
-            print(f"[bmv] thread crashed: {exc}", flush=True)
+        except Exception:
+            print(f"[bmv] thread crashed:\n{traceback.format_exc()}", flush=True)
 
     t = threading.Thread(target=_target, name="bmv", daemon=True)
     t.start()
