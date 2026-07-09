@@ -88,6 +88,57 @@ PRIORITY_CAN = 10
 # latest cached VE.Direct reading and decide whether to send.
 BMV_SAMPLE_INTERVAL = 0.1
 
+# Discharge current magnitude (amps) that starts the drive elapsed timer.
+# Overridable with --drive-start-current-a.
+DEFAULT_DRIVE_START_CURRENT_A = 0.5
+
+
+class DriveStopwatch:
+    """Elapsed drive timer. Starts the first time battery *discharge*
+    current is observed from either the BMV or the BMS, then keeps counting
+    for the life of the process (i.e. until the Pi shuts down or the sender
+    restarts).
+
+    Both the Victron BMV (VE.Direct 'I', mA) and the EG4/Pylontech BMS
+    (0x356 battery_current_a) report discharge as negative current, so
+    "draw" here means current < -start_threshold_a. The threshold exists so
+    quiescent electronics load / sensor noise doesn't trip the timer before
+    the car actually pulls meaningful current.
+
+    Shared as a single module-level instance across the BMV and CAN threads;
+    whichever source sees draw first wins. Thread-safe.
+    """
+
+    def __init__(self, start_threshold_a=DEFAULT_DRIVE_START_CURRENT_A):
+        self.start_threshold_a = start_threshold_a
+        self._start = None
+        self._lock = threading.Lock()
+
+    def update(self, current_a, source=""):
+        """Feed a battery current reading in amps (negative = discharging)."""
+        if current_a is None:
+            return
+        with self._lock:
+            if self._start is None and current_a < -self.start_threshold_a:
+                self._start = time.monotonic()
+                print(
+                    f"[drive-timer] Battery draw detected from {source} "
+                    f"({current_a:+.2f} A) — elapsed timer started",
+                    flush=True,
+                )
+
+    def elapsed_s(self):
+        """Whole seconds since the timer started, 0 if it hasn't yet.
+        Int, because the wire format packs elapsed_s as a u32 (>I)."""
+        with self._lock:
+            if self._start is None:
+                return 0
+            return int(time.monotonic() - self._start)
+
+
+# Shared across the BMV and CAN(BMS) streams — whichever trips first wins.
+_drive_stopwatch = DriveStopwatch()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE LOOP — BMV single-stream sender (unchanged)
@@ -468,7 +519,22 @@ def build_bmv_sender_components(args):
         power_delta_w=args.power_delta_w,
         heartbeat_seconds=args.heartbeat_seconds,
     )
-    sink = lambda reading: write_telemetry_csv(args.csv_path, reading)
+    _drive_stopwatch.start_threshold_a = args.drive_start_current_a
+
+    def bmv_sink(reading):
+        # The sink runs inside _process_reading() *before* policy.classify()
+        # and the packet builder, so stamping elapsed_s here puts it on the
+        # wire (BMVField.ELAPSED_S) as well as in the CSV. The BMV policy
+        # doesn't watch elapsed_s, so a ticking timer never triggers a
+        # transmit by itself — it just rides along on every packet sent.
+        current_ma = reading["fields"].get("current_ma")
+        _drive_stopwatch.update(
+            current_ma / 1000.0 if current_ma is not None else None,
+            source="BMV",
+        )
+        reading["fields"]["elapsed_s"] = _drive_stopwatch.elapsed_s()
+        write_telemetry_csv(args.csv_path, reading)
+
     return {
         "reader": reader,
         "normalizer": normalize_bmv_frame,
@@ -476,7 +542,7 @@ def build_bmv_sender_components(args):
         "packet_builder": build_bmv_packet,
         "device_id": args.device_id,
         "log_prefix": "bmv",
-        "sink": sink,
+        "sink": bmv_sink,
         "priority": PRIORITY_BMV,
     }
 
@@ -526,8 +592,21 @@ def build_can_sender_components(args):
         heartbeat_seconds=args.bms_heartbeat_seconds,
     )
 
+    _drive_stopwatch.start_threshold_a = args.drive_start_current_a
+
     mppt_sink = lambda r: write_telemetry_csv(args.csv_path_mppt, r)
-    bms_sink = lambda r: write_telemetry_csv(args.csv_path_bms, r)
+
+    def bms_sink(reading):
+        # Only 0x356 frames carry battery_current_a; other BMS frame types
+        # simply won't have the key and can't trip the timer. elapsed_s is
+        # stamped on every BMS reading so the receiver still gets the timer
+        # even if the BMV is offline. The BMS policy doesn't watch
+        # elapsed_s, so it never triggers a transmit by itself.
+        _drive_stopwatch.update(
+            reading["fields"].get("battery_current_a"), source="BMS"
+        )
+        reading["fields"]["elapsed_s"] = _drive_stopwatch.elapsed_s()
+        write_telemetry_csv(args.csv_path_bms, reading)
 
     return {
         "reader": reader,
@@ -663,6 +742,10 @@ def build_parser():
     parser.add_argument("--dry-run", action="store_true", help="Build packets but do not send over the transport")
     parser.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID, help="Telemetry device id (BMV)")
     parser.add_argument("--csv-path", default=DEFAULT_CSV_PATH, help="CSV output path (BMV)")
+    parser.add_argument("--drive-start-current-a", type=float,
+                        default=DEFAULT_DRIVE_START_CURRENT_A,
+                        help="Battery discharge current (A) from BMV or BMS "
+                             "that starts the elapsed drive timer")
 
     # BMV
     parser.add_argument("--bmv-port", default=DEFAULT_BMV_PORT, help="BMV VE.Direct serial device")
