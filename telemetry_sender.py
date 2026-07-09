@@ -61,10 +61,10 @@ DEFAULT_CSV_PATH_BMS = "bms_data.csv"
 DEFAULT_NUM_MPPTS = 6
 
 # How often the CAN transmit thread wakes up to check for changes (seconds).
-# Pkt0 (power) is checked every tick; pkt1 (status) every STATUS_TICKS ticks
-# to prioritize power data over mode/fault/temp on the LoRa link.
+# Pkt0 (power) is checked every tick; pkt1 (status, incl. BMS 0x351) is
+# throttled per-slot to STATUS_MIN_INTERVAL_S — see _transmit_thread.
 CAN_SAMPLE_INTERVAL = 0.0
-STATUS_TICKS = 15  # transmit status frames at most once per 5 × 1s = 5s
+STATUS_MIN_INTERVAL_S = 5.0  # min seconds between attempts per status slot
 
 # Cap how many CAN packets the transmit thread will push out in a single
 # tick. Without this, a correlated event (e.g. sharp acceleration moving
@@ -255,7 +255,8 @@ def run_sender(
 # Transmit thread: wakes every CAN_SAMPLE_INTERVAL seconds, iterates the
 #                  cache, runs policy.classify() on each slot, and sends
 #                  whatever is due. Power frames (pkt0) are checked every
-#                  tick; status frames (pkt1) every STATUS_TICKS ticks.
+#                  tick; status frames (pkt1) are throttled per-slot to
+#                  STATUS_MIN_INTERVAL_S.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_can_sender(*, reader, streams, transport, log_prefix="can"):
@@ -282,7 +283,6 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
             reader.close()
 
     def _transmit_thread():
-        tick = 0
         # Rotating start position into the (stable-order) cache keys, so a
         # fixed cap on sends-per-tick doesn't always favor the same handful
         # of slots. dict() preserves insertion order and updating a key's
@@ -293,10 +293,26 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
         # the starting index each tick guarantees every slot gets serviced
         # over successive ticks instead of a permanent subset.
         rr_start = 0
+
+        # Per-slot throttle for MPPT status frames (pkt1). The old scheme
+        # ("only process status frames when tick % STATUS_TICKS == 0")
+        # interacted badly with the round-robin pointer: the pointer's
+        # position on status-eligible ticks is deterministic and cycles
+        # through only a few spots, so status slots outside those spots
+        # were NEVER processed — specific boards' fault/mode/temp data
+        # simply never transmitted. A per-slot timestamp keeps the intent
+        # (status uses little airtime, power frames dominate) while the
+        # round-robin guarantees every slot is eventually reached.
+        #
+        # NOTE: this gate applies to MPPT frames only. The old code did
+        # `can_id & 0x0F` on every frame, which also caught BMS 0x351
+        # (charge/discharge limits) since it ends in 1, throttling and
+        # starving it identically.
+        last_status_attempt = {}  # can_id -> time.monotonic()
+
         try:
             while not stop_event.is_set():
                 time.sleep(CAN_SAMPLE_INTERVAL)
-                tick += 1
 
                 with cache_lock:
                     snapshot = dict(cache)
@@ -319,11 +335,14 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                     if comps is None:
                         continue
 
-                    # Deprioritize status frames (pkt1): only process every
-                    # STATUS_TICKS ticks so power frames dominate LoRa airtime.
-                    packet_id = raw_frame.get("can_id", 0) & 0x0F
-                    if packet_id == 1 and (tick % STATUS_TICKS) != 0:
-                        continue
+                    # Deprioritize MPPT status frames (pkt1): each status
+                    # slot is processed at most once per STATUS_MIN_INTERVAL_S
+                    # so power frames dominate LoRa airtime.
+                    if kind == "mppt" and (raw_frame.get("can_id", 0) & 0x0F) == 1:
+                        now = time.monotonic()
+                        if now - last_status_attempt.get(can_id, 0.0) < STATUS_MIN_INTERVAL_S:
+                            continue
+                        last_status_attempt[can_id] = now
 
                     _process_reading(comps, raw_frame, transport, log_prefix)
                     sent_this_tick += 1
