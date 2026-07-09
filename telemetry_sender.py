@@ -231,6 +231,16 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
 
     def _transmit_thread():
         tick = 0
+        # Rotating start position into the (stable-order) cache keys, so a
+        # fixed cap on sends-per-tick doesn't always favor the same handful
+        # of slots. dict() preserves insertion order and updating a key's
+        # value never moves it, so a plain "break after N" here always cut
+        # off at the same point every tick -- e.g. servicing only the first
+        # 3 CAN slots ever inserted (some MPPT boards) forever, while the
+        # rest never even got policy.classify() called on them. Rotating
+        # the starting index each tick guarantees every slot gets serviced
+        # over successive ticks instead of a permanent subset.
+        rr_start = 0
         try:
             while not stop_event.is_set():
                 time.sleep(CAN_SAMPLE_INTERVAL)
@@ -239,13 +249,19 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                 with cache_lock:
                     snapshot = dict(cache)
 
+                keys = list(snapshot.keys())
+                n = len(keys)
+                if n == 0:
+                    continue
+
                 sent_this_tick = 0
-                for (kind, can_id), raw_frame in snapshot.items():
-                    if sent_this_tick >= MAX_CAN_SENDS_PER_TICK:
-                        # Leave the rest in the cache — they're still "due"
-                        # per policy.classify() and will be picked up next
-                        # tick instead of monopolizing the modem in one burst.
-                        break
+                checked = 0
+                idx = rr_start % n
+                while checked < n and sent_this_tick < MAX_CAN_SENDS_PER_TICK:
+                    kind, can_id = keys[idx]
+                    raw_frame = snapshot[(kind, can_id)]
+                    idx = (idx + 1) % n
+                    checked += 1
 
                     comps = streams.get(kind)
                     if comps is None:
@@ -259,7 +275,15 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
 
                     _process_reading(comps, raw_frame, transport, log_prefix)
                     sent_this_tick += 1
-                    time.sleep(0.0)  # give modem time to recover between sends
+                    # Real pause (not the old no-op time.sleep(0.0)): gives
+                    # the modem a beat and, just as importantly, gives the
+                    # OS/GIL an actual scheduling window to run the BMV
+                    # thread so its higher-priority send can enqueue and
+                    # win the shared transport lock between CAN sends,
+                    # instead of CAN looping back-to-back with no gap.
+                    time.sleep(0.05)
+
+                rr_start = idx  # next tick picks up where this one left off
 
         except Exception as exc:
             print(f"[{log_prefix}] Transmit thread crashed: {exc}", flush=True)
