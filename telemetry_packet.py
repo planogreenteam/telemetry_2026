@@ -19,7 +19,11 @@ import struct
 from enum import IntEnum
 
 
-PROTOCOL_VERSION = 1
+# v2: BMV current_ma widened i16 -> i32 (i16 caps at +/-32.767 A and a
+# hard acceleration exceeds that, making struct.pack raise and every BMV
+# packet drop for as long as the pedal is down), and BMV gained
+# PEAK_CURRENT_MA. Sender and receiver must be updated together.
+PROTOCOL_VERSION = 2
 CRC_FORMAT = ">H"
 HEADER_FORMAT = ">BBBBHIH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -46,21 +50,25 @@ class EventType(IntEnum):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BMVField(IntEnum):
-    VOLTAGE_MV   = 1 << 0
-    CURRENT_MA   = 1 << 1
-    POWER_W      = 1 << 2
-    CHARGE_STATE = 1 << 3
-    ALARM        = 1 << 4
-    ELAPSED_S    = 1 << 5
+    VOLTAGE_MV      = 1 << 0
+    CURRENT_MA      = 1 << 1
+    POWER_W         = 1 << 2
+    CHARGE_STATE    = 1 << 3
+    ALARM           = 1 << 4
+    ELAPSED_S       = 1 << 5
+    PEAK_CURRENT_MA = 1 << 6
 
 
+# current_ma / peak_current_ma are i32: the BMV reports mA, and i16 tops out
+# at 32.767 A — real discharge peaks exceed that.
 BMV_FIELD_LAYOUT = (
-    (BMVField.VOLTAGE_MV,   "voltage_mv",   ">H"),
-    (BMVField.CURRENT_MA,   "current_ma",   ">h"),
-    (BMVField.POWER_W,      "power_w",      ">h"),
-    (BMVField.CHARGE_STATE, "charge_state", ">B"),
-    (BMVField.ALARM,        "alarm",        ">B"),
-    (BMVField.ELAPSED_S,    "elapsed_s",    ">I"),
+    (BMVField.VOLTAGE_MV,      "voltage_mv",      ">H"),
+    (BMVField.CURRENT_MA,      "current_ma",      ">i"),
+    (BMVField.POWER_W,         "power_w",         ">h"),
+    (BMVField.CHARGE_STATE,    "charge_state",    ">B"),
+    (BMVField.ALARM,           "alarm",           ">B"),
+    (BMVField.ELAPSED_S,       "elapsed_s",       ">I"),
+    (BMVField.PEAK_CURRENT_MA, "peak_current_ma", ">i"),
 )
 
 
@@ -185,11 +193,12 @@ _RAW_INT_MSG_TYPES = frozenset({MsgType.BMV})
 # Applied during decode only. Converts raw wire integers to engineering units
 # for BMV fields before they reach the receiver / Influx writer.
 _DECODE_SCALES = {
-    "voltage_mv":   1000,   # mV -> V
-    "current_ma":   1000,   # mA -> A
-    "power_w":      1,
-    "charge_state": 1,
-    "alarm":        1,
+    "voltage_mv":      1000,   # mV -> V
+    "current_ma":      1000,   # mA -> A
+    "peak_current_ma": 1000,   # mA -> A
+    "power_w":         1,
+    "charge_state":    1,
+    "alarm":           1,
 }
 
 
@@ -199,6 +208,14 @@ def _scale_for(field_name):
 
 def crc16(data: bytes) -> int:
     return binascii.crc_hqx(data, 0xFFFF)
+
+
+def _format_range(fmt):
+    """(min, max) representable by a struct integer format like '>h'."""
+    bits = struct.calcsize(fmt) * 8
+    if fmt[-1].islower():  # signed
+        return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    return 0, (1 << bits) - 1
 
 
 def _pack_header(msg_type, event_type, device_id, seq, timestamp, field_mask):
@@ -262,11 +279,20 @@ def _build_typed_packet(normalized, event_type, seq, msg_type, layout,
             encoded = int(round(float(value) * _scale_for(field_name)))
         try:
             payload.extend(struct.pack(fmt, encoded))
-        except struct.error as exc:
-            raise ValueError(
-                f"Cannot pack {field_name}={value} (encoded={encoded}, "
-                f"fmt={fmt}): {exc}"
-            ) from exc
+        except struct.error:
+            # Clamp instead of raising: raising here aborted the WHOLE
+            # packet, so one out-of-range field silenced the stream for as
+            # long as the value stayed out of range (this is exactly how
+            # i16 current_ma made the BMV go dark during acceleration).
+            # A clamped reading ("at least 32.767 A") beats no reading.
+            lo, hi = _format_range(fmt)
+            clamped = min(max(encoded, lo), hi)
+            print(
+                f"[packet] {field_name}={value} (encoded={encoded}) out of "
+                f"range for {fmt}; clamping to {clamped}",
+                flush=True,
+            )
+            payload.extend(struct.pack(fmt, clamped))
         field_mask |= int(bit)
 
     header = _pack_header(
