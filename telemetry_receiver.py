@@ -21,7 +21,7 @@ from BMV.bmv_handler import format_bmv_packet
 from CAN.can_handler import format_mppt_packet, format_bms_packet
 from LORA.lora_transport import LoRaTransport, extract_hex_payload
 from storage.event_csv_sink import write_event_csv
-from telemetry_packet import MsgType, decode_packet
+from telemetry_packet import MsgType, decode_packet, is_batch, split_batch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,12 +233,35 @@ def _looks_decoded(decoded) -> bool:
 
 
 def decode_line(line, extract_payload, decoder, ascii_fallback=True):
+    """Decode one modem RX line into a LIST of events. A line usually
+    carries one packet, but a batch frame (see telemetry_packet.build_batch)
+    carries several — the sender packs all due CAN readings into one LoRa
+    frame to save modem round-trips."""
     payload_hex = extract_payload(line)
     if not payload_hex:
-        return None
+        return []
     packet = bytes.fromhex(payload_hex)
     if not packet:
-        return None
+        return []
+
+    if is_batch(packet):
+        events = []
+        try:
+            sub_packets = split_batch(packet)
+        except ValueError as exc:
+            print(f"[rx] Bad batch frame: {exc}")
+            return []
+        for sub in sub_packets:
+            try:
+                decoded = decoder(sub)
+            except ValueError as exc:
+                # One corrupted element (each sub-packet has its own CRC)
+                # doesn't invalidate its batch-mates.
+                print(f"[rx] Failed to decode batch element: {exc}")
+                continue
+            if _looks_decoded(decoded):
+                events.append(decoded)
+        return events
 
     binary_error = None
     if len(packet) > 2:
@@ -249,16 +272,16 @@ def decode_line(line, extract_payload, decoder, ascii_fallback=True):
             decoded = None
 
         if _looks_decoded(decoded):
-            return decoded
+            return [decoded]
 
     if ascii_fallback:
         ascii_decoded = decode_ascii_payload(packet)
         if ascii_decoded is not None:
-            return ascii_decoded
+            return [ascii_decoded]
 
     if binary_error is not None:
         raise binary_error
-    return None
+    return []
 
 
 def route_packet(decoded, handlers=None):
@@ -285,6 +308,42 @@ def _now_str():
     return datetime.now().strftime("%H:%M:%S")
 
 
+class SeqGapTracker:
+    """Detects missing wire sequence numbers per stream, making packet loss
+    a number instead of a feeling — this is how radio/timing changes get
+    validated. Keyed by msg_type (not device_id): all six MPPTs share one
+    sender-side policy and therefore one seq counter, so per-device seqs
+    are intentionally interleaved. Note the sender allocates a seq per
+    *built* packet, so a send the modem rejected counts as a gap here too —
+    which is correct, the packet was lost either way."""
+
+    def __init__(self):
+        self._last = {}
+        self._received = 0
+        self._lost = 0
+
+    def observe(self, decoded):
+        msg_type = decoded.get("msg_type")
+        seq = decoded.get("seq")
+        if not isinstance(msg_type, MsgType) or seq is None:
+            return
+        self._received += 1
+        last = self._last.get(msg_type)
+        self._last[msg_type] = seq
+        if last is None:
+            return
+        gap = (seq - last - 1) & 0xFFFF
+        # Ignore huge "gaps" (sender restart / duplicate) — only count
+        # plausible runs of loss.
+        if 0 < gap < 0x1000:
+            self._lost += gap
+            total = self._received + self._lost
+            print(f"[rx] seq gap: {msg_type.name} missed {gap} packet(s) "
+                  f"(last={last}, got={seq}); session loss "
+                  f"{self._lost}/{total} ({100.0 * self._lost / total:.1f}%)",
+                  flush=True)
+
+
 def run_receiver(
     *,
     transport,
@@ -304,6 +363,7 @@ def run_receiver(
 
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 10
+    seq_gaps = SeqGapTracker()
 
     while True:
         try:
@@ -325,28 +385,30 @@ def run_receiver(
                 print(f"[rx-raw] {line}")
 
             try:
-                decoded = decode_line(line, extract_payload, decoder,
-                                      ascii_fallback=ascii_fallback)
+                events = decode_line(line, extract_payload, decoder,
+                                     ascii_fallback=ascii_fallback)
             except ValueError as exc:
                 print(f"[rx] Failed to parse/decode '{line}': {exc}")
                 continue
 
-            if decoded is None:
+            if not events:
                 if not show_raw:
                     print(f"[rx-raw] {line}")
                 continue
 
-            msg_type = decoded.get("msg_type")
-            type_label = msg_type.name if isinstance(msg_type, MsgType) else str(msg_type)
-            print(f"[{_now_str()}] Received packet  type={type_label}", flush=True)
+            for decoded in events:
+                msg_type = decoded.get("msg_type")
+                type_label = msg_type.name if isinstance(msg_type, MsgType) else str(msg_type)
+                print(f"[{_now_str()}] Received packet  type={type_label}", flush=True)
 
-            dispatch_event(decoded, sinks=sinks)
+                seq_gaps.observe(decoded)
+                dispatch_event(decoded, sinks=sinks)
 
-            routed = route_packet(decoded, handlers=handlers)
-            if routed is None:
-                print(f"[rx] {decoded}")
-            elif routed != "":
-                print(routed)
+                routed = route_packet(decoded, handlers=handlers)
+                if routed is None:
+                    print(f"[rx] {decoded}")
+                elif routed != "":
+                    print(routed)
 
         time.sleep(poll_interval)
 
@@ -359,7 +421,8 @@ DEFAULT_TRANSPORT = "lora"
 DEFAULT_PORT = "COM4"
 DEFAULT_BAUD = 9600
 DEFAULT_FREQ = "868.100"
-DEFAULT_BW = 0
+# BW 2 = 500 kHz — MUST match telemetry_sender.py DEFAULT_BW.
+DEFAULT_BW = 2
 DEFAULT_SF = 7
 DEFAULT_POWER = 20
 DEFAULT_CR = 1
@@ -475,8 +538,12 @@ def build_parser():
     parser.add_argument("--rx-ack", type=int, default=DEFAULT_RX_ACK, help="ACK mode 0/1/2")
     parser.add_argument("--recv-format", type=int, choices=(0, 1), default=0,
                         help="AT+RECV format 0=hex 1=text")
-    parser.add_argument("--poll", type=float, default=1.0,
-                        help="Seconds between AT+RECV polls")
+    parser.add_argument("--poll", type=float, default=0.15,
+                        help="Seconds between AT+RECV polls. Keep this well "
+                             "under the sender's per-frame interval: if the "
+                             "modem buffers only the most recent packet, "
+                             "slow polling silently drops everything that "
+                             "arrived earlier in the window.")
     parser.add_argument("--csv-path", default=DEFAULT_CSV_PATH,
                         help="CSV output path for decoded events")
     parser.add_argument("--show-raw", action="store_true",
@@ -520,7 +587,7 @@ def main(argv=None):
                 extract_payload=extract_hex_payload,
                 recv_format=args.recv_format,
                 poll_interval=args.poll,
-                wait=0.3,
+                wait=0.15,
                 show_raw=args.show_raw,
                 handlers=build_handlers(args),
                 sinks=build_sinks(args, influx_writer=influx_writer),

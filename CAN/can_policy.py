@@ -97,10 +97,22 @@ class GenericTransmitPolicy:
             self._pending_now = now
         return event_type
 
-    def mark_sent(self, reading):
-        # Commit whatever classify() decided. We use the cached pending
-        # state rather than recomputing, so this method is cheap and the
-        # source/slot key matches exactly.
+    def allocate_seq(self):
+        """Take the next wire sequence number. Allocated when a packet is
+        BUILT (not when it is confirmed sent), so every packet on the air
+        has a unique seq even when several readings from this policy go
+        out inside one batch frame, and the receiver's gap counter treats
+        a failed send exactly like a lost packet."""
+        current_seq = self.seq
+        self.seq = (self.seq + 1) & 0xFFFF
+        return current_seq
+
+    def commit_sent(self, reading):
+        """Record `reading` as the last successfully transmitted state for
+        its (source, slot). Called only after the transport accepts the
+        packet, so a failed send neither resets the heartbeat timer nor
+        suppresses the retry. Uses the cached pending state from classify()
+        when it matches, so the source/slot key is exact."""
         if self._pending_key is not None and self._pending_reading is reading:
             self._state[self._pending_key] = {
                 "fields": dict(reading["fields"]),
@@ -110,18 +122,20 @@ class GenericTransmitPolicy:
             self._pending_reading = None
             self._pending_now = None
         else:
-            # Defensive: caller invoked mark_sent on a different reading
-            # than the last classify(). Record current state anyway so we
-            # don't get stuck claiming "nothing changed" forever.
+            # Defensive: caller committed a different reading than the last
+            # classify(). Record current state anyway so we don't get stuck
+            # claiming "nothing changed" forever.
             src, slot = self._keys(reading)
             self._state[(src, slot)] = {
                 "fields": dict(reading["fields"]),
                 "sent_at": time.time(),
             }
 
-        current_seq = self.seq
-        self.seq = (self.seq + 1) & 0xFFFF
-        return current_seq
+    def mark_sent(self, reading):
+        # Legacy combined form; prefer allocate_seq() + commit_sent().
+        seq = self.allocate_seq()
+        self.commit_sent(reading)
+        return seq
 
     def _changed_enough(self, current_fields, previous_fields):
         # New or removed field counts as a change.

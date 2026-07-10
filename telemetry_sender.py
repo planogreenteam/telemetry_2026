@@ -18,7 +18,7 @@ from BMV.bmv_policy import BMVTransmitPolicy
 from BMV.bmv_reader import BMVReader
 from LORA.lora_transport import LoRaTransport
 from storage.csv_sink import write_telemetry_csv
-from telemetry_packet import build_bmv_packet
+from telemetry_packet import build_bmv_packet, build_batch, BATCH_MAX_BYTES
 
 
 DEFAULT_DEVICE = "all"
@@ -31,7 +31,10 @@ DEFAULT_DEVICE_ID = 1
 DEFAULT_LORA_PORT = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
 DEFAULT_LORA_BAUD = 9600
 DEFAULT_FREQ = "868.100"
-DEFAULT_BW = 0
+# BW 2 = 500 kHz: 4x less airtime per packet than the old 125 kHz, paid for
+# with range we don't need (ground station stays within ~1 km of the car).
+# MUST match telemetry_receiver.py DEFAULT_BW — mismatched BW means no link.
+DEFAULT_BW = 2
 DEFAULT_SF = 7
 DEFAULT_POWER = 20
 DEFAULT_CR = 1
@@ -44,9 +47,14 @@ DEFAULT_GROUP = 0
 DEFAULT_ACK = 0
 DEFAULT_RETRIES = 3
 
-DEFAULT_VOLTAGE_DELTA_MV = 1
-DEFAULT_CURRENT_DELTA_MA = 10
-DEFAULT_POWER_DELTA_W = 1
+# BMV delta thresholds sized above sensor noise so a transmit means the
+# value actually moved. The old 1 mV / 10 mA / 1 W thresholds were below
+# noise, so BMV re-sent near-duplicate readings on every tick and wasted
+# shared airtime. Raising them is safe for extremes: peak_current_ma rides
+# on every packet, so a suppressed intermediate frame can't lose the peak.
+DEFAULT_VOLTAGE_DELTA_MV = 50
+DEFAULT_CURRENT_DELTA_MA = 200
+DEFAULT_POWER_DELTA_W = 10
 DEFAULT_HEARTBEAT_SECONDS = 3
 
 # CAN defaults
@@ -66,16 +74,12 @@ DEFAULT_NUM_MPPTS = 6
 CAN_SAMPLE_INTERVAL = 0.0
 STATUS_MIN_INTERVAL_S = 5.0  # min seconds between attempts per status slot
 
-# Cap how many CAN packets the transmit thread will push out in a single
-# tick. Without this, a correlated event (e.g. sharp acceleration moving
-# voltage/current on every MPPT + the BMS at once) can queue up a dozen-plus
-# sends back to back, monopolizing the shared LoRa modem for several
-# seconds and starving higher-priority BMV sends even with a priority lock
-# in place (priority only lets BMV jump the queue *between* sends, not
-# preempt one in flight). Capping the burst size spreads it across more
-# ticks so the modem is never held for more than a few sends at a time.
-# Anything left over just gets re-evaluated (and is still "due") next tick.
-MAX_CAN_SENDS_PER_TICK = 3
+# Cap how many CAN packets ride in one batch frame per tick. All due CAN
+# readings now go out as a SINGLE AT+SEND (see build_batch), so this cap is
+# about frame size, not modem monopolization: 4 packets of ~40 bytes max
+# stay comfortably under BATCH_MAX_BYTES. Anything left over is still "due"
+# and gets picked up next tick (the round-robin pointer guarantees it).
+MAX_CAN_PACKETS_PER_FRAME = 4
 
 # send_hex priority values — lower number = served first when multiple
 # threads are waiting on PriorityLockedTransport. BMV carries the peak
@@ -217,22 +221,28 @@ class TxStats:
 # CORE LOOP — BMV single-stream sender (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_reading(components, raw_frame, transport, log_prefix):
+def _prepare_reading(components, raw_frame, log_prefix):
+    """Normalize -> sink -> classify -> allocate seq -> build packet.
+
+    Returns (packet_bytes, reading, event_type, seq) when the policy wants
+    this reading transmitted, else None. Touches neither the transport nor
+    the policy's last-sent state — pair with _commit_sent() once the bytes
+    are actually accepted by the modem. Splitting prepare from commit is
+    what lets the CAN path pack several prepared readings into one batch
+    frame before a single send."""
     normalizer = components["normalizer"]
     policy = components["policy"]
     packet_builder = components["packet_builder"]
     device_id = components["device_id"]
     sink = components.get("sink")
     stats = components.get("stats")
-    on_sent = components.get("on_sent")
     sub_prefix = components.get("log_prefix", log_prefix)
-    priority = components.get("priority", PRIORITY_CAN)
 
     try:
         reading = normalizer(raw_frame, device_id)
     except Exception:
         print(f"[{sub_prefix}] Normalize failed:\n{traceback.format_exc()}", flush=True)
-        return
+        return None
 
     if sink is not None:
         try:
@@ -242,26 +252,61 @@ def _process_reading(components, raw_frame, transport, log_prefix):
 
     event_type = policy.classify(reading)
     if event_type is None:
-        return
+        return None
 
-    # Peek the next seq without committing policy state — mark_sent() now
-    # runs only after the transport accepts the packet. Previously a failed
-    # send still counted as "sent": last_sent was updated to values that
-    # never reached the receiver and the heartbeat timer reset, so during a
-    # stretch of modem errors the reading (e.g. the acceleration current
-    # peak) was dropped with nothing scheduled to retry it. Retries of the
-    # same reading reuse the same seq, which the receiver tolerates.
-    seq = policy.seq
+    # Seq is allocated at build time so every packet on the air is unique
+    # (several readings from one shared policy can ride in one batch), and
+    # a failed send shows up at the receiver as a seq gap — i.e. exactly
+    # like the lost packet it is. Last-sent state commits only on success:
+    # a failed send neither resets the heartbeat timer nor suppresses the
+    # retry, so a reading like the acceleration current peak keeps being
+    # re-attempted until it actually gets out.
+    seq = policy.allocate_seq()
     try:
         packet = packet_builder(reading, event_type, seq)
     except Exception:
         print(f"[{sub_prefix}] Packet build failed:\n{traceback.format_exc()}", flush=True)
         if stats is not None:
             stats.record(False)
+        return None
+
+    return packet, reading, event_type, seq
+
+
+def _commit_sent(components, reading, event_type, seq, log_prefix, tx_seconds):
+    """Bookkeeping for a packet the modem accepted: commit policy state,
+    count it, fire the on_sent hook, log it."""
+    sub_prefix = components.get("log_prefix", log_prefix)
+    components["policy"].commit_sent(reading)
+    stats = components.get("stats")
+    if stats is not None:
+        stats.record(True)
+    on_sent = components.get("on_sent")
+    if on_sent is not None:
+        try:
+            on_sent(reading)
+        except Exception:
+            print(f"[{sub_prefix}] on_sent hook failed:\n{traceback.format_exc()}", flush=True)
+    print(
+        f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
+        f"tx={tx_seconds:.2f}s fields={reading['fields']}",
+        flush=True,
+    )
+
+
+def _process_reading(components, raw_frame, transport, log_prefix):
+    """Single-packet path (BMV + dry-run): prepare, send, commit."""
+    prepared = _prepare_reading(components, raw_frame, log_prefix)
+    if prepared is None:
         return
+    packet, reading, event_type, seq = prepared
+
+    sub_prefix = components.get("log_prefix", log_prefix)
+    stats = components.get("stats")
+    priority = components.get("priority", PRIORITY_CAN)
 
     if transport is None:
-        policy.mark_sent(reading)
+        components["policy"].commit_sent(reading)
         print(
             f"[{sub_prefix}] {event_type.name} seq={seq} "
             f"fields={reading['fields']} hex={packet.hex()}",
@@ -282,19 +327,7 @@ def _process_reading(components, raw_frame, transport, log_prefix):
             stats.record(False)
         return
 
-    policy.mark_sent(reading)
-    if stats is not None:
-        stats.record(True)
-    if on_sent is not None:
-        try:
-            on_sent(reading)
-        except Exception:
-            print(f"[{sub_prefix}] on_sent hook failed:\n{traceback.format_exc()}", flush=True)
-    print(
-        f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
-        f"tx={time.time()-t0:.2f}s fields={reading['fields']}",
-        flush=True,
-    )
+    _commit_sent(components, reading, event_type, seq, log_prefix, time.time() - t0)
 
 
 def run_sender(
@@ -429,10 +462,15 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                 if n == 0:
                     continue
 
-                sent_this_tick = 0
+                # Gather everything due this tick into ONE batch frame.
+                # A full 6-MPPT + BMS refresh used to cost seven serialized
+                # AT+SEND round-trips; as a batch it costs one.
+                entries = []       # (comps, reading, event_type, seq)
+                batch_packets = []
+                batch_bytes = 2    # batch header: magic + count
                 checked = 0
                 idx = rr_start % n
-                while checked < n and sent_this_tick < MAX_CAN_SENDS_PER_TICK:
+                while checked < n and len(batch_packets) < MAX_CAN_PACKETS_PER_FRAME:
                     kind, can_id = keys[idx]
                     raw_frame = snapshot[(kind, can_id)]
                     idx = (idx + 1) % n
@@ -451,17 +489,57 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                             continue
                         last_status_attempt[can_id] = now
 
-                    _process_reading(comps, raw_frame, transport, log_prefix)
-                    sent_this_tick += 1
-                    # Real pause (not the old no-op time.sleep(0.0)): gives
-                    # the modem a beat and, just as importantly, gives the
-                    # OS/GIL an actual scheduling window to run the BMV
-                    # thread so its higher-priority send can enqueue and
-                    # win the shared transport lock between CAN sends,
-                    # instead of CAN looping back-to-back with no gap.
-                    time.sleep(0.05)
+                    prepared = _prepare_reading(comps, raw_frame, log_prefix)
+                    if prepared is None:
+                        continue
+                    packet, reading, event_type, seq = prepared
+                    if batch_bytes + 1 + len(packet) > BATCH_MAX_BYTES:
+                        # Safety net — shouldn't trigger with the packet
+                        # count cap, but never build an oversized frame.
+                        # The dropped reading re-classifies next tick.
+                        break
+                    batch_packets.append(packet)
+                    batch_bytes += 1 + len(packet)
+                    entries.append((comps, reading, event_type, seq))
 
                 rr_start = idx  # next tick picks up where this one left off
+
+                if not batch_packets:
+                    continue
+
+                # A single packet goes out bare (saves the container bytes);
+                # the receiver handles both forms.
+                if len(batch_packets) == 1:
+                    frame = batch_packets[0]
+                else:
+                    frame = build_batch(batch_packets)
+
+                t0 = time.time()
+                try:
+                    try:
+                        transport.send_hex(frame.hex(), priority=PRIORITY_CAN)
+                    except TypeError:
+                        transport.send_hex(frame.hex())
+                except Exception:
+                    print(f"[{log_prefix}] Batch send failed "
+                          f"({len(batch_packets)} packet(s)):\n"
+                          f"{traceback.format_exc()}", flush=True)
+                    for comps, _, _, _ in entries:
+                        stream_stats = comps.get("stats")
+                        if stream_stats is not None:
+                            stream_stats.record(False)
+                    continue
+                tx_seconds = time.time() - t0
+
+                for comps, reading, event_type, seq in entries:
+                    _commit_sent(comps, reading, event_type, seq,
+                                 log_prefix, tx_seconds)
+
+                # Give the modem a beat and, just as importantly, give the
+                # OS/GIL a scheduling window so the BMV thread's
+                # higher-priority send can win the shared transport lock
+                # between CAN frames.
+                time.sleep(0.05)
 
         except Exception:
             print(f"[{log_prefix}] Transmit thread crashed:\n{traceback.format_exc()}", flush=True)
@@ -843,8 +921,8 @@ class PriorityLockedTransport:
     This does NOT preempt a send that's already in flight — the modem can
     only do one AT+SEND at a time — but it guarantees that once the current
     send finishes, the next one to go is the highest-priority one waiting,
-    not simply whoever queued up first. Combined with MAX_CAN_SENDS_PER_TICK
-    (which limits how many CAN sends can even be queued back-to-back), this
+    not simply whoever queued up first. Combined with CAN batching (all due
+    CAN readings go out as one frame per tick — see run_can_sender), this
     bounds the worst-case delay for a BMV send to roughly one in-flight
     send's duration, instead of an entire correlated CAN burst.
 

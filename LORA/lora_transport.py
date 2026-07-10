@@ -25,12 +25,27 @@ def send_failed(lines):
     return any(marker in line for line in upper_lines for marker in SEND_FAILURE_MARKERS)
 
 
-def read_available_lines(ser, settle_time=0.2, quiet_gap=0.05, max_wait=1.5):
-    # Poll until the serial buffer goes quiet (no new bytes for `quiet_gap`
-    # seconds) or `max_wait` is hit, instead of a single fixed-length sleep.
-    # A bursty/slow modem write can otherwise get sliced mid-packet if the
-    # second burst arrives just after a one-shot read_all().
-    time.sleep(settle_time)
+def _split_lines(buf):
+    raw = bytes(buf).decode(errors="ignore")
+    if not raw:
+        return []
+    return [line.strip() for line in raw.replace("\r", "\n").split("\n") if line.strip()]
+
+
+def read_available_lines(ser, settle_time=0.2, quiet_gap=0.05, max_wait=1.5,
+                         stop_predicate=None):
+    # Collect bytes until the serial buffer goes quiet (no new bytes for
+    # `quiet_gap` seconds after at least `settle_time` has elapsed) or
+    # `max_wait` is hit. Bytes are collected from t=0 rather than after a
+    # blind sleep, so a fast modem response is never waited out.
+    #
+    # `stop_predicate(lines)` short-circuits the wait: as soon as the lines
+    # received so far satisfy it (e.g. a terminal "OK"/"ERROR" from an
+    # AT command), return immediately. This is the difference between every
+    # send_hex() costing a fixed ~0.5s of dead time and costing only the
+    # modem's actual response latency (~tens of ms) — with ~8 telemetry
+    # streams sharing one modem, that dead time was the pipeline's
+    # throughput ceiling.
     buf = bytearray()
     start = last_data = time.monotonic()
     while True:
@@ -38,23 +53,26 @@ def read_available_lines(ser, settle_time=0.2, quiet_gap=0.05, max_wait=1.5):
         if chunk:
             buf.extend(chunk)
             last_data = time.monotonic()
+            if stop_predicate is not None:
+                lines = _split_lines(buf)
+                if lines and stop_predicate(lines):
+                    break
         now = time.monotonic()
-        if now - last_data > quiet_gap or now - start > max_wait:
+        if now - start >= settle_time and now - last_data > quiet_gap:
+            break
+        if now - start > max_wait:
             break
         time.sleep(0.01)
-    raw = bytes(buf).decode(errors="ignore")
-    if not raw:
-        return []
-    return [line.strip() for line in raw.replace("\r", "\n").split("\n") if line.strip()]
+    return _split_lines(buf)
 
 
-def send_cmd(ser, cmd, wait=0.25):
+def send_cmd(ser, cmd, wait=0.25, stop_predicate=None):
     ser.write(f"{cmd.strip()}\r\n".encode())
-    return read_available_lines(ser, wait)
+    return read_available_lines(ser, wait, stop_predicate=stop_predicate)
 
 
-def require_ok(ser, cmd, wait=0.25, allow_empty=False):
-    lines = send_cmd(ser, cmd, wait)
+def require_ok(ser, cmd, wait=0.25, allow_empty=False, stop_predicate=None):
+    lines = send_cmd(ser, cmd, wait, stop_predicate=stop_predicate)
     if any(is_error_line(line) for line in lines):
         raise RuntimeError(f"Modem rejected command: {cmd}")
     if not lines and not allow_empty:
@@ -176,10 +194,27 @@ class LoRaTransport:
             ser,
             f"AT+SEND=0,{payload_hex},{self.ack},{self.retries}",
             wait=self.send_wait_time(),
+            stop_predicate=self._send_terminal,
         )
         if self.ack != 0 and send_failed(lines):
             raise RuntimeError(f"Receiver acknowledgement failed: {' | '.join(lines)}")
         return lines
+
+    def _send_terminal(self, lines):
+        """True once the modem's AT+SEND response is conclusive, so
+        read_available_lines can return immediately instead of waiting out
+        the settle window. With ack enabled, a bare OK only means "command
+        accepted" — the ACK/NO-ACK verdict comes later, so OK is not
+        terminal in that mode."""
+        for line in lines:
+            upper = line.upper()
+            if is_error_line(line):
+                return True
+            if any(marker in upper for marker in SEND_FAILURE_MARKERS):
+                return True
+            if self.ack == 0 and upper == "OK":
+                return True
+        return False
 
     def receive_hex_lines(self, recv_format=0, wait=0.5):
         ser = self._require_serial()
@@ -193,8 +228,11 @@ class LoRaTransport:
                 yield line, bytes.fromhex(payload_hex)
 
     def send_wait_time(self):
+        # This is the minimum settle window, not a hard sleep any more:
+        # _send_terminal short-circuits it the moment the modem answers.
+        # It only matters when the modem says nothing at all.
         if self.ack == 0:
-            return 0.5
+            return 0.15
         return 1.5 + (self.retries * 5.5)
 
     def _require_serial(self):

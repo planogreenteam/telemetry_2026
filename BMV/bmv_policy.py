@@ -44,12 +44,27 @@ class BMVTransmitPolicy:
 
         return None
 
-    def mark_sent(self, reading):
-        self.last_sent = reading
-        self.last_sent_at = time.time()
+    def allocate_seq(self):
+        """Take the next wire sequence number. Allocated when a packet is
+        BUILT (not when it is confirmed sent), so every packet on the air
+        has a unique seq and the receiver's gap counter treats a failed
+        send exactly like a lost packet."""
         current_seq = self.seq
         self.seq = (self.seq + 1) & 0xFFFF
         return current_seq
+
+    def commit_sent(self, reading):
+        """Record `reading` as the last successfully transmitted state.
+        Called only after the transport accepts the packet, so a failed
+        send neither resets the heartbeat timer nor suppresses the retry."""
+        self.last_sent = reading
+        self.last_sent_at = time.time()
+
+    def mark_sent(self, reading):
+        # Legacy combined form; prefer allocate_seq() + commit_sent().
+        seq = self.allocate_seq()
+        self.commit_sent(reading)
+        return seq
 
     def _charge_state_changed(self, reading):
         return (

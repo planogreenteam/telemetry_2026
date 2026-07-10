@@ -320,6 +320,69 @@ def build_bms_packet(normalized, event_type, seq):
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH CONTAINER
+#
+# One LoRa frame can carry several ordinary packets. Each AT+SEND costs the
+# same command-handling overhead regardless of payload size, so sending a
+# 6-MPPT + BMS refresh as one frame instead of seven cuts the modem time for
+# a full-car update by ~7x. Format:
+#
+#     u8 BATCH_MAGIC | u8 count | ( u8 len | packet bytes ) * count
+#
+# Sub-packets are unmodified v2 packets (header+payload+CRC), so building and
+# decoding reuse the existing single-packet code end to end.
+# ─────────────────────────────────────────────────────────────────────────────
+
+BATCH_MAGIC = 0xB5  # deliberately far from any PROTOCOL_VERSION value
+
+# Keep whole frames comfortably inside the modem's AT command buffer and a
+# single LoRa payload. Hex encoding doubles this on the serial link.
+BATCH_MAX_BYTES = 180
+
+
+def build_batch(packets):
+    if not packets:
+        raise ValueError("build_batch needs at least one packet")
+    if len(packets) > 255:
+        raise ValueError("Too many packets for one batch")
+    out = bytearray((BATCH_MAGIC, len(packets)))
+    for pkt in packets:
+        if not 1 <= len(pkt) <= 255:
+            raise ValueError(f"Batch element size {len(pkt)} out of range")
+        out.append(len(pkt))
+        out.extend(pkt)
+    if len(out) > BATCH_MAX_BYTES:
+        raise ValueError(f"Batch frame {len(out)} bytes exceeds {BATCH_MAX_BYTES}")
+    return bytes(out)
+
+
+def is_batch(data: bytes) -> bool:
+    return len(data) >= 2 and data[0] == BATCH_MAGIC
+
+
+def split_batch(data: bytes):
+    """Return the list of sub-packet byte strings inside a batch frame.
+    Each still carries its own CRC and goes through decode_packet as usual."""
+    if not is_batch(data):
+        raise ValueError("Not a batch frame")
+    count = data[1]
+    packets = []
+    offset = 2
+    for _ in range(count):
+        if offset >= len(data):
+            raise ValueError("Batch truncated: missing length byte")
+        length = data[offset]
+        offset += 1
+        if offset + length > len(data):
+            raise ValueError("Batch truncated: element shorter than declared")
+        packets.append(data[offset:offset + length])
+        offset += length
+    if offset != len(data):
+        raise ValueError("Batch has unexpected trailing bytes")
+    return packets
+
+
 def decode_packet(packet: bytes) -> dict:
     if len(packet) < HEADER_SIZE + CRC_SIZE:
         raise ValueError("Packet too short")
