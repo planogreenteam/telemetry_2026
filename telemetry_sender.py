@@ -140,6 +140,79 @@ class DriveStopwatch:
 _drive_stopwatch = DriveStopwatch()
 
 
+class PeakHold:
+    """Deepest discharge current (most negative current_ma) seen since the
+    last successful BMV transmit.
+
+    The transmit path samples a latest-value cache, so while the modem is
+    busy individual VE.Direct frames are routinely skipped — without this,
+    the one frame holding the acceleration current peak can be overwritten
+    before it is ever sent. Instead, the peak rides along on the next packet
+    that does get out (BMVField.PEAK_CURRENT_MA), so a radio blackout can
+    only ever *delay* the peak, not lose it.
+
+    Thread-safe: updated by the BMV reader thread, consumed by the transmit
+    thread."""
+
+    def __init__(self):
+        self._peak_ma = None
+        self._lock = threading.Lock()
+
+    def update(self, current_ma):
+        if current_ma is None or current_ma >= 0:
+            return  # only discharge (negative on the BMV) counts
+        with self._lock:
+            if self._peak_ma is None or current_ma < self._peak_ma:
+                self._peak_ma = current_ma
+
+    def peek(self):
+        with self._lock:
+            return self._peak_ma
+
+    def reset(self, sent_value):
+        # Clear only if the transmitted value is still the current peak; a
+        # deeper peak recorded by the reader thread after peek() must
+        # survive to ride on the next send.
+        with self._lock:
+            if self._peak_ma == sent_value:
+                self._peak_ma = None
+
+
+class TxStats:
+    """Rolling per-stream send success/failure counter.
+
+    Prints a one-line summary every `interval` seconds (only when there was
+    at least one attempt), so a burst of modem errors — e.g. the LA66
+    rejecting AT+SEND while it's still busy with a CAN flood — is visible
+    in the console instead of scrolling past as isolated tracebacks."""
+
+    def __init__(self, prefix, interval=5.0):
+        self.prefix = prefix
+        self.interval = interval
+        self._ok = 0
+        self._fail = 0
+        self._last_report = time.monotonic()
+        self._lock = threading.Lock()
+
+    def record(self, ok):
+        with self._lock:
+            if ok:
+                self._ok += 1
+            else:
+                self._fail += 1
+            now = time.monotonic()
+            if now - self._last_report >= self.interval:
+                print(
+                    f"[{self.prefix}] tx stats: {self._ok} ok, "
+                    f"{self._fail} failed in last "
+                    f"{now - self._last_report:.0f}s",
+                    flush=True,
+                )
+                self._ok = 0
+                self._fail = 0
+                self._last_report = now
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE LOOP — BMV single-stream sender (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,6 +223,8 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     packet_builder = components["packet_builder"]
     device_id = components["device_id"]
     sink = components.get("sink")
+    stats = components.get("stats")
+    on_sent = components.get("on_sent")
     sub_prefix = components.get("log_prefix", log_prefix)
     priority = components.get("priority", PRIORITY_CAN)
 
@@ -169,14 +244,24 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     if event_type is None:
         return
 
-    seq = policy.mark_sent(reading)
+    # Peek the next seq without committing policy state — mark_sent() now
+    # runs only after the transport accepts the packet. Previously a failed
+    # send still counted as "sent": last_sent was updated to values that
+    # never reached the receiver and the heartbeat timer reset, so during a
+    # stretch of modem errors the reading (e.g. the acceleration current
+    # peak) was dropped with nothing scheduled to retry it. Retries of the
+    # same reading reuse the same seq, which the receiver tolerates.
+    seq = policy.seq
     try:
         packet = packet_builder(reading, event_type, seq)
     except Exception:
         print(f"[{sub_prefix}] Packet build failed:\n{traceback.format_exc()}", flush=True)
+        if stats is not None:
+            stats.record(False)
         return
 
     if transport is None:
+        policy.mark_sent(reading)
         print(
             f"[{sub_prefix}] {event_type.name} seq={seq} "
             f"fields={reading['fields']} hex={packet.hex()}",
@@ -184,21 +269,32 @@ def _process_reading(components, raw_frame, transport, log_prefix):
         )
         return
 
+    t0 = time.time()
     try:
-        t0 = time.time()
         try:
             transport.send_hex(packet.hex(), priority=priority)
         except TypeError:
             # Plain (non-priority-aware) transports don't accept priority.
             transport.send_hex(packet.hex())
-        print(
-            f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
-            f"tx={time.time()-t0:.2f}s fields={reading['fields']}",
-            flush=True,
-        )
     except Exception:
         print(f"[{sub_prefix}] Transport send failed:\n{traceback.format_exc()}", flush=True)
+        if stats is not None:
+            stats.record(False)
         return
+
+    policy.mark_sent(reading)
+    if stats is not None:
+        stats.record(True)
+    if on_sent is not None:
+        try:
+            on_sent(reading)
+        except Exception:
+            print(f"[{sub_prefix}] on_sent hook failed:\n{traceback.format_exc()}", flush=True)
+    print(
+        f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
+        f"tx={time.time()-t0:.2f}s fields={reading['fields']}",
+        flush=True,
+    )
 
 
 def run_sender(
@@ -211,6 +307,9 @@ def run_sender(
     device_id=None,
     log_prefix="telemetry",
     sink=None,
+    reader_sink=None,
+    on_sent=None,
+    stats=None,
     transport=None,
     priority=PRIORITY_BMV,
 ):
@@ -232,6 +331,8 @@ def run_sender(
         "packet_builder": packet_builder,
         "device_id": device_id,
         "sink": sink,
+        "stats": stats,
+        "on_sent": on_sent,
         "log_prefix": log_prefix,
         "priority": priority,
     }
@@ -240,6 +341,12 @@ def run_sender(
     try:
         while True:
             raw_frame = reader.read_frame()
+            if reader_sink is not None:
+                try:
+                    reader_sink(normalizer(raw_frame, device_id))
+                except Exception:
+                    print(f"[{log_prefix}] reader sink failed:\n"
+                          f"{traceback.format_exc()}", flush=True)
             _process_reading(components, raw_frame, transport, log_prefix)
     finally:
         reader.close()
@@ -413,13 +520,22 @@ def run_bmv_cached_sender(
     device_id,
     transport,
     sink=None,
+    reader_sink=None,
+    on_sent=None,
+    stats=None,
     log_prefix="bmv",
     sample_interval=BMV_SAMPLE_INTERVAL,
     priority=PRIORITY_BMV,
 ):
     """BMV sender using a latest-value cache + timed TX thread, so a busy
     shared modem never delays BMV by more than one send, and BMV always
-    transmits its freshest reading rather than a stale queued one."""
+    transmits its freshest reading rather than a stale queued one.
+
+    `reader_sink` runs in the READER thread once per VE.Direct frame
+    (~1 Hz) — CSV logging and peak tracking live there so they keep
+    running even while the transmit thread is blocked inside send_hex().
+    `sink` runs in the transmit thread and should only stamp wire fields.
+    `on_sent` fires after a send the transport accepted."""
 
     cache = {}
     cache_lock = threading.Lock()
@@ -431,6 +547,8 @@ def run_bmv_cached_sender(
         "packet_builder": packet_builder,
         "device_id": device_id,
         "sink": sink,
+        "stats": stats,
+        "on_sent": on_sent,
         "log_prefix": log_prefix,
         "priority": priority,
     }
@@ -455,6 +573,12 @@ def run_bmv_cached_sender(
                     got_first_frame = True
                 with cache_lock:
                     cache["latest"] = raw_frame
+                if reader_sink is not None:
+                    try:
+                        reader_sink(normalizer(raw_frame, device_id))
+                    except Exception:
+                        print(f"[{log_prefix}] reader sink failed:\n"
+                              f"{traceback.format_exc()}", flush=True)
         except Exception:
             print(f"[{log_prefix}] Reader thread crashed:\n{traceback.format_exc()}",
                   flush=True)
@@ -540,19 +664,38 @@ def build_bmv_sender_components(args):
     )
     _drive_stopwatch.start_threshold_a = args.drive_start_current_a
 
-    def bmv_sink(reading):
-        # The sink runs inside _process_reading() *before* policy.classify()
-        # and the packet builder, so stamping elapsed_s here puts it on the
-        # wire (BMVField.ELAPSED_S) as well as in the CSV. The BMV policy
-        # doesn't watch elapsed_s, so a ticking timer never triggers a
-        # transmit by itself — it just rides along on every packet sent.
+    peak_hold = PeakHold()
+
+    def bmv_reader_sink(reading):
+        # Runs in the READER thread once per VE.Direct frame (~1 Hz), so
+        # the on-car CSV and the peak tracker keep recording even while the
+        # transmit thread is blocked in send_hex(). (Previously the CSV was
+        # written from the transmit thread, which went blind at exactly the
+        # moments worth recording.)
         current_ma = reading["fields"].get("current_ma")
         _drive_stopwatch.update(
             current_ma / 1000.0 if current_ma is not None else None,
             source="BMV",
         )
+        peak_hold.update(current_ma)
         reading["fields"]["elapsed_s"] = _drive_stopwatch.elapsed_s()
         write_telemetry_csv(args.csv_path, reading)
+
+    def bmv_tx_sink(reading):
+        # Runs in the transmit thread inside _process_reading(), *before*
+        # policy.classify() and the packet builder — stamps wire-only
+        # fields. The BMV policy watches neither elapsed_s nor
+        # peak_current_ma, so these ride along without triggering sends.
+        reading["fields"]["elapsed_s"] = _drive_stopwatch.elapsed_s()
+        peak_ma = peak_hold.peek()
+        if peak_ma is not None:
+            reading["fields"]["peak_current_ma"] = peak_ma
+
+    def bmv_on_sent(reading):
+        # The peak went out on this packet; start a fresh peak window.
+        sent_peak = reading["fields"].get("peak_current_ma")
+        if sent_peak is not None:
+            peak_hold.reset(sent_peak)
 
     return {
         "reader": reader,
@@ -561,7 +704,10 @@ def build_bmv_sender_components(args):
         "packet_builder": build_bmv_packet,
         "device_id": args.device_id,
         "log_prefix": "bmv",
-        "sink": bmv_sink,
+        "sink": bmv_tx_sink,
+        "reader_sink": bmv_reader_sink,
+        "on_sent": bmv_on_sent,
+        "stats": TxStats("bmv"),
         "priority": PRIORITY_BMV,
     }
 
@@ -627,6 +773,10 @@ def build_can_sender_components(args):
         reading["fields"]["elapsed_s"] = _drive_stopwatch.elapsed_s()
         write_telemetry_csv(args.csv_path_bms, reading)
 
+    # One shared counter for all CAN streams — the interesting number is
+    # how the modem behaves under the combined CAN load, not per-board.
+    can_stats = TxStats("can")
+
     return {
         "reader": reader,
         "log_prefix": "can",
@@ -638,6 +788,7 @@ def build_can_sender_components(args):
                 "device_id": args.mppt_device_id,
                 "sink": mppt_sink,
                 "log_prefix": "mppt",
+                "stats": can_stats,
                 "priority": PRIORITY_CAN,
             },
             "bms": {
@@ -647,6 +798,7 @@ def build_can_sender_components(args):
                 "device_id": args.bms_device_id,
                 "sink": bms_sink,
                 "log_prefix": "bms",
+                "stats": can_stats,
                 "priority": PRIORITY_CAN,
             },
         },
