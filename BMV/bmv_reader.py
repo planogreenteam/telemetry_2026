@@ -25,9 +25,23 @@ class BMVReader:
     def __init__(self, serial_port, baudrate):
         self.serial = serial.Serial(port=serial_port, baudrate=baudrate, timeout=1)
         self.frame = {}
+        # Fields and running byte-sum for the block currently being read.
+        # Blocks are only merged into self.frame once their VE.Direct
+        # checksum verifies: the sum of every byte in the block (including
+        # the "Checksum" line and its checksum byte) must be 0 mod 256.
+        # Summing whole readline() outputs is equivalent to summing the
+        # frame as specified: the spec frames each field as
+        # "\r\nKEY<tab>VALUE" (leading \r\n), while readline() yields
+        # "KEY<tab>VALUE\r\n" (trailing \r\n) -- same bytes, same total.
+        # Without this check, EMI from the motor controller during
+        # acceleration can garble a digit of "I" and we'd record (and
+        # transmit) a bogus current as if it were real.
+        self._block_fields = {}
+        self._block_sum = 0
         # Diagnostic-only state -- doesn't affect parsing behavior.
         self._lines_seen = 0
         self._blocks_seen = 0
+        self._checksum_failures = 0
         self._last_report = time.monotonic()
         self._first_line_logged = False
 
@@ -35,18 +49,21 @@ class BMVReader:
         while True:
             raw = self.serial.readline()
             line = raw.decode(errors="ignore").strip()
+            self._block_sum = (self._block_sum + sum(raw)) & 0xFF
 
             now = time.monotonic()
             if now - self._last_report >= DIAGNOSTIC_INTERVAL:
                 print(
                     f"[bmv-reader] alive: {self._lines_seen} lines, "
-                    f"{self._blocks_seen} complete blocks seen in last "
+                    f"{self._blocks_seen} complete blocks, "
+                    f"{self._checksum_failures} checksum failures in last "
                     f"{DIAGNOSTIC_INTERVAL:.0f}s, port_open={self.serial.is_open}, "
                     f"pending_fields={sorted(self.frame.keys())}",
                     flush=True,
                 )
                 self._lines_seen = 0
                 self._blocks_seen = 0
+                self._checksum_failures = 0
                 self._last_report = now
 
             if not line:
@@ -62,7 +79,7 @@ class BMVReader:
 
             if "\t" in line:
                 key, value = line.split("\t", 1)
-                self.frame[key] = value
+                self._block_fields[key] = value
             else:
                 # A non-empty line without a tab isn't valid VE.Direct
                 # key\tvalue framing -- likely garbled data (wrong baud
@@ -72,7 +89,20 @@ class BMVReader:
 
             if line.startswith("Checksum"):
                 self._blocks_seen += 1
-                # End of a block. Only return if the accumulated frame
+                block_ok = self._block_sum == 0
+                block_fields = self._block_fields
+                self._block_fields = {}
+                self._block_sum = 0
+
+                if not block_ok:
+                    self._checksum_failures += 1
+                    print(f"[bmv-reader] Checksum FAILED for block with keys "
+                          f"{sorted(block_fields.keys())}; discarding block. "
+                          f"(Noise/EMI on the VE.Direct line?)", flush=True)
+                    continue
+
+                self.frame.update(block_fields)
+                # End of a valid block. Only return if the accumulated frame
                 # actually contains the live-measurement keys we need.
                 # Otherwise keep accumulating into the next block.
                 if all(k in self.frame for k in required_keys):
