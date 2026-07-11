@@ -241,16 +241,34 @@ class LoRaTransport:
         return self.serial
 
 
-def extract_hex_payload(line):
+def extract_hex_payload(line, min_bytes=3):
     # Only look for hex bytes before the first comma. Modems append
     # RSSI/SNR metadata after the payload separated by commas (e.g.
     # "... d1 59 ,-33,13"), and without this the two-char tokens in
     # "-33" and "13" get scooped up as bogus extra payload bytes,
     # corrupting the packet and shifting where the CRC field is read from.
-    payload_part = line.split(",", 1)[0]
+    payload_part = line.split(",", 1)[0].strip()
+
+    # A line that BEGINS with a negative number is the tail of an RX line
+    # that got split across two AT+RECV polls — i.e. just the ",-48,13"
+    # RSSI/SNR metadata with its payload left behind in the previous poll.
+    # Without this check, the digits of the RSSI value ("-48") parse as a
+    # one-byte "packet" (0x48 = 'H') and surface as junk ASCII events.
+    if payload_part.startswith("-"):
+        return None
+
     hex_bytes = HEX_PATTERN.findall(payload_part)
-    if hex_bytes:
-        candidate = "".join(hex_bytes)
-        if len(candidate) % 2 == 0:
-            return candidate
+    if not hex_bytes:
+        return None
+
+    # Fragment guard: the smallest legitimate binary packet is
+    # header (14) + CRC (2) = 16 bytes, and even intentional ASCII test
+    # messages are longer than a couple of characters. One- or two-byte
+    # "payloads" are metadata fragments or line noise, never real data.
+    if len(hex_bytes) < min_bytes:
+        return None
+
+    candidate = "".join(hex_bytes)
+    if len(candidate) % 2 == 0:
+        return candidate
     return None
