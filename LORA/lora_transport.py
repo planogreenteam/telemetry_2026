@@ -132,6 +132,17 @@ class LoRaTransport:
         self.rx_timeout = rx_timeout
         self.rx_ack = rx_ack
         self.serial = None
+        # Minimum spacing between AT+SEND commands. The RECEIVER's modem
+        # prints every received frame as a ~130-char hex dump over its
+        # 9600-baud UART (~140 ms of serial time per frame); transmitting
+        # faster than it can print overflows its output buffer and the
+        # ground station sees spliced/truncated hex — i.e. corrupt packets
+        # even when the RF link is perfect.
+        self.min_send_gap = 0.15
+        self._last_send_done = 0.0
+        # Buffer for unsolicited RX output (stream mode) — holds partial
+        # lines between reads so a hex dump is never sliced mid-line.
+        self._rx_buf = bytearray()
 
     def __enter__(self):
         max_attempts = 3
@@ -190,12 +201,20 @@ class LoRaTransport:
 
     def send_hex(self, payload_hex):
         ser = self._require_serial()
-        lines = require_ok(
-            ser,
-            f"AT+SEND=0,{payload_hex},{self.ack},{self.retries}",
-            wait=self.send_wait_time(),
-            stop_predicate=self._send_terminal,
-        )
+        # Pace sends so the receiver's modem UART can drain between frames
+        # (see min_send_gap comment in __init__).
+        gap = self.min_send_gap - (time.monotonic() - self._last_send_done)
+        if gap > 0:
+            time.sleep(gap)
+        try:
+            lines = require_ok(
+                ser,
+                f"AT+SEND=0,{payload_hex},{self.ack},{self.retries}",
+                wait=self.send_wait_time(),
+                stop_predicate=self._send_terminal,
+            )
+        finally:
+            self._last_send_done = time.monotonic()
         if self.ack != 0 and send_failed(lines):
             raise RuntimeError(f"Receiver acknowledgement failed: {' | '.join(lines)}")
         return lines
@@ -215,6 +234,33 @@ class LoRaTransport:
             if self.ack == 0 and upper == "OK":
                 return True
         return False
+
+    def read_stream_lines(self):
+        """Drain the modem's UNSOLICITED output and return only COMPLETE
+        lines; partial lines stay buffered until their newline arrives.
+
+        The LA66 firmware streams every received frame on its own
+        ("Data: (HEX:) ..." / "Rssi= ..." / "rxDone"), so the receiver
+        doesn't need to poll AT+RECV at all — polling both doubles the
+        modem's 9600-baud UART traffic (each frame printed twice) and,
+        under load, chunk-based reads slice a hex dump mid-line, which
+        then decodes as a corrupt packet. Line-complete framing makes
+        sliced payloads structurally impossible on the host side."""
+        ser = self._require_serial()
+        chunk = ser.read_all()
+        if chunk:
+            self._rx_buf.extend(chunk)
+        lines = []
+        while True:
+            newline_at = self._rx_buf.find(b"\n")
+            if newline_at < 0:
+                break
+            raw = self._rx_buf[:newline_at]
+            del self._rx_buf[:newline_at + 1]
+            line = raw.decode(errors="ignore").strip()
+            if line:
+                lines.append(line)
+        return lines
 
     def receive_hex_lines(self, recv_format=0, wait=0.5):
         ser = self._require_serial()

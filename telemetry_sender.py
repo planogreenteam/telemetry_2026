@@ -38,7 +38,11 @@ DEFAULT_BW = 2
 DEFAULT_SF = 7
 DEFAULT_POWER = 20
 DEFAULT_CR = 1
-DEFAULT_CRC = 0
+# Radio-level CRC ON: with it off, corrupted frames (RF bit flips) are
+# delivered to the receiver instead of being dropped by the radio, and they
+# waste the receiver modem's scarce 9600-baud UART time being printed as
+# garbage. MUST match the receiver.
+DEFAULT_CRC = 1
 DEFAULT_HEADER = 0
 DEFAULT_IQ = 0
 DEFAULT_PREAMBLE = 8
