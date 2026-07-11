@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import queue
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -57,7 +59,12 @@ class InfluxWriter:
         self.default_bucket = bucket
         self.bucket_map = bucket_map or {}
         self.measurement = measurement
-        self.client = InfluxDBClient(url=url, token=token, org=org)
+        # timeout is in milliseconds. Keep it short: a healthy Influx
+        # answers a write in well under a second, and a sick one should
+        # fail fast on the background writer thread rather than hold a
+        # connection open for the library's ~10s default.
+        self.client = InfluxDBClient(url=url, token=token, org=org,
+                                     timeout=5_000)
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         print(f"[influx] Connected to {url}  default_bucket={bucket}")
         for msg_type, b in self.bucket_map.items():
@@ -141,9 +148,70 @@ class InfluxWriter:
 
 
 def make_influx_sink(writer: InfluxWriter, tags: dict):
+    # Legacy synchronous sink — writes inline in the caller's thread.
+    # The receiver now uses AsyncInfluxSink instead so a slow/dead Influx
+    # can never stall the modem polling loop. Kept for any external code
+    # importing it directly.
     def _sink(event: dict):
         writer.write(event, tags=tags)
     return _sink
+
+
+class AsyncInfluxSink:
+    """Wraps an InfluxWriter so writes happen on a background thread.
+
+    The receive loop polls the modem with AT+RECV on a tight interval; if
+    the modem buffers only the most recent packet, any stall in that loop
+    silently drops whatever arrived earlier in the window. A synchronous
+    Influx write is exactly such a stall: a healthy write costs tens of ms,
+    but a sick Influx (resource-starved Docker/WSL, slow disk) holds the
+    connection for up to the client timeout — per packet. Handing events to
+    a bounded queue instead makes the receive-loop cost of this sink a
+    put_nowait(), i.e. microseconds, regardless of Influx's health.
+
+    If the queue fills (sustained outage or persistent slowness), the
+    NEWEST events are dropped for Influx only — the CSV sink runs
+    independently and still records everything, so an outage costs
+    dashboard points, never data.
+    """
+
+    def __init__(self, writer: InfluxWriter, tags: dict, maxsize: int = 500):
+        self._writer = writer
+        self._tags = tags
+        self._q = queue.Queue(maxsize=maxsize)
+        self._dropped = 0
+        self._thread = threading.Thread(
+            target=self._worker, name="influx-writer", daemon=True
+        )
+        self._thread.start()
+
+    def __call__(self, event: dict):
+        try:
+            self._q.put_nowait(event)
+        except queue.Full:
+            self._dropped += 1
+            # Log the first drop and then every 100th, so a long outage
+            # doesn't flood the console at packet rate.
+            if self._dropped % 100 == 1:
+                print(
+                    f"[influx] queue full ({self._q.maxsize} events "
+                    f"waiting); dropped {self._dropped} event(s) so far "
+                    f"(Influx too slow or down — CSV still recording)",
+                    flush=True,
+                )
+
+    def _worker(self):
+        while True:
+            event = self._q.get()
+            try:
+                # InfluxWriter.write() already catches and logs write
+                # failures; this outer catch is a belt-and-braces guard so
+                # nothing can kill the writer thread.
+                self._writer.write(event, tags=self._tags)
+            except Exception as exc:
+                print(f"[influx] Write failed: {exc}", flush=True)
+            finally:
+                self._q.task_done()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -488,7 +556,9 @@ def build_sinks(args, influx_writer=None):
 
     if influx_writer is not None:
         tags = {"source": "telemetry_receiver", "port": args.port}
-        sinks.append(make_influx_sink(influx_writer, tags))
+        # Async: Influx writes run on their own thread so a slow or dead
+        # Influx can never stall modem polling (which drops packets).
+        sinks.append(AsyncInfluxSink(influx_writer, tags))
 
     return tuple(sinks)
 
