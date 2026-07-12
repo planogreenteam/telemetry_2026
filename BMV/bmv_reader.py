@@ -42,6 +42,11 @@ class BMVReader:
         self._lines_seen = 0
         self._blocks_seen = 0
         self._checksum_failures = 0
+        # Valid blocks completed since the last returned frame. VE.Direct
+        # alternates Block A (live V/I/P) and Block B (history H1..H18), so
+        # ONE incomplete block between returns is the normal cadence —
+        # only a run of them means Block A has actually gone missing.
+        self._blocks_since_return = 0
         self._last_report = time.monotonic()
         self._first_line_logged = False
 
@@ -80,6 +85,14 @@ class BMVReader:
             if "\t" in line:
                 key, value = line.split("\t", 1)
                 self._block_fields[key] = value
+            elif line.startswith("Checksum"):
+                # The checksum VALUE is an arbitrary binary byte: when it
+                # isn't valid UTF-8, decode(errors="ignore") deletes it, and
+                # when it's a whitespace byte, strip() eats it — leaving the
+                # bare string 'Checksum' with no tab. That's normal, not
+                # noise: validation uses the raw byte sum (unaffected by
+                # decode) and block completion keys off startswith below.
+                pass
             else:
                 # A non-empty line without a tab isn't valid VE.Direct
                 # key\tvalue framing -- likely garbled data (wrong baud
@@ -106,14 +119,25 @@ class BMVReader:
                 # actually contains the live-measurement keys we need.
                 # Otherwise keep accumulating into the next block.
                 if all(k in self.frame for k in required_keys):
+                    self._blocks_since_return = 0
                     frame = dict(self.frame)
                     self.frame = {}
                     return frame
-                else:
+
+                self._blocks_since_return += 1
+                # VE.Direct alternates Block A (live V/I/P) and Block B
+                # (history), so exactly one incomplete block between
+                # returned frames is the NORMAL cadence — stay quiet for
+                # it. Two or more valid blocks in a row without V/I/P
+                # means Block A is genuinely absent (wrong device on the
+                # port, odd firmware, or Block A consistently failing
+                # checksum), and that's worth shouting about.
+                if self._blocks_since_return >= 2:
                     missing = [k for k in required_keys if k not in self.frame]
-                    print(f"[bmv-reader] Block complete but missing required "
-                          f"keys {missing}; have {sorted(self.frame.keys())}. "
-                          f"Waiting for next block.", flush=True)
+                    print(f"[bmv-reader] {self._blocks_since_return} valid "
+                          f"blocks in a row without required keys {missing}; "
+                          f"have {sorted(self.frame.keys())}. Is a BMV "
+                          f"actually on this port?", flush=True)
                 # else: keep going, the next block will fill in the missing fields
 
     def close(self):
