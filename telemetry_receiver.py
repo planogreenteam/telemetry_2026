@@ -376,6 +376,16 @@ def _now_str():
     return datetime.now().strftime("%H:%M:%S")
 
 
+# Modem status lines that accompany every streamed frame. Pure chatter —
+# skipped silently unless --show-raw is set.
+_MODEM_CHATTER_PREFIXES = ("RXDONE", "RSSI", "OK", "NULL", "SNR")
+
+
+def _is_modem_chatter(line: str) -> bool:
+    upper = line.strip().upper()
+    return any(upper.startswith(p) for p in _MODEM_CHATTER_PREFIXES)
+
+
 class SeqGapTracker:
     """Detects missing wire sequence numbers per stream, making packet loss
     a number instead of a feeling — this is how radio/timing changes get
@@ -420,72 +430,66 @@ def run_receiver(
     recv_format=0,
     poll_interval=0.2,
     wait=0.3,
-    rx_mode="stream",
     show_raw=False,
     handlers=None,
     sinks=None,
     log_prefix="receiver",
     ascii_fallback=True,
+    rx_mode="stream",
 ):
-    """rx_mode="stream" (default): read the modem's unsolicited RX output
-    continuously via complete-line framing — no AT+RECV polling. The LA66
-    prints every received frame on its own; polling on top of that doubles
-    its 9600-baud UART traffic (each frame arrives twice) and chunk reads
-    can slice a hex dump mid-line, which decodes as a corrupt packet.
-    rx_mode="poll": legacy AT+RECV polling, for firmware that doesn't
-    stream RX output unsolicited."""
-    print(f"[{log_prefix}] Starting receiver loop (rx_mode={rx_mode})", flush=True)
+    use_stream = rx_mode == "stream" and hasattr(transport, "read_stream_lines")
+    if rx_mode == "stream" and not use_stream:
+        print(f"[{log_prefix}] Transport has no read_stream_lines(); "
+              f"falling back to AT+RECV polling", flush=True)
+
+    if use_stream:
+        # Stream mode: the modem prints each received frame on its own —
+        # no AT+RECV round-trip, so each frame crosses the modem's
+        # 9600-baud UART exactly ONCE (polling makes it print everything
+        # twice, doubling UART load and truncating batch dumps under
+        # load). Draining the buffer is nearly free, so the loop can spin
+        # much faster than the AT+RECV poll cadence.
+        poll_interval = min(poll_interval, 0.05)
+        print(f"[{log_prefix}] RX mode: stream (unsolicited modem output, "
+              f"poll={poll_interval}s)", flush=True)
+    else:
+        print(f"[{log_prefix}] RX mode: AT+RECV polling "
+              f"(poll={poll_interval}s)", flush=True)
+
+    print(f"[{log_prefix}] Starting receiver loop", flush=True)
     print(f"\nListening for LoRa data - press Ctrl-C to stop\n", flush=True)
 
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 10
     seq_gaps = SeqGapTracker()
 
-    # The modem can surface one frame TWICE (unsolicited dump + an AT+RECV
-    # response). Identical payload bytes can never legitimately repeat —
-    # every packet carries a fresh seq inside its CRC — so an exact repeat
-    # within the window is always the same frame and is processed once.
-    recent_payloads = {}  # payload_hex -> monotonic time first seen
-    DEDUPE_WINDOW_S = 2.0
-
     while True:
-        if rx_mode == "stream":
-            lines = transport.read_stream_lines()
-            if not lines:
-                time.sleep(0.02)
-                continue
-        else:
-            try:
-                lines = transport.receive_hex_lines(recv_format=recv_format, wait=wait)
-                consecutive_errors = 0
-            except RuntimeError as exc:
-                consecutive_errors += 1
-                print(f"[rx] Modem poll failed ({consecutive_errors}/"
-                      f"{MAX_CONSECUTIVE_ERRORS}): {exc}", flush=True)
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    print(f"[rx] Modem unresponsive for {MAX_CONSECUTIVE_ERRORS} "
-                          f"polls in a row - giving up.", flush=True)
-                    raise
-                time.sleep(min(2.0 * consecutive_errors, 10.0))
-                continue
-
-        now_mono = time.monotonic()
-        if len(recent_payloads) > 64:
-            recent_payloads = {
-                payload: seen for payload, seen in recent_payloads.items()
-                if now_mono - seen < DEDUPE_WINDOW_S
-            }
+        try:
+            if use_stream:
+                lines = transport.read_stream_lines()
+            else:
+                lines = transport.receive_hex_lines(recv_format=recv_format,
+                                                    wait=wait)
+            consecutive_errors = 0
+        except (RuntimeError, OSError) as exc:
+            consecutive_errors += 1
+            print(f"[rx] Modem poll failed ({consecutive_errors}/"
+                  f"{MAX_CONSECUTIVE_ERRORS}): {exc}", flush=True)
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print(f"[rx] Modem unresponsive for {MAX_CONSECUTIVE_ERRORS} "
+                      f"polls in a row - giving up.", flush=True)
+                raise
+            time.sleep(min(2.0 * consecutive_errors, 10.0))
+            continue
 
         for line in lines:
             if show_raw:
                 print(f"[rx-raw] {line}")
 
-            payload_hex = extract_payload(line)
-            if payload_hex:
-                first_seen = recent_payloads.get(payload_hex)
-                if first_seen is not None and now_mono - first_seen < DEDUPE_WINDOW_S:
-                    continue  # same frame printed twice by the modem
-                recent_payloads[payload_hex] = now_mono
+            # Per-frame modem status lines (rxDone, Rssi=, ...) are
+            # expected in stream mode — not worth a console line each.
+            if _is_modem_chatter(line):
+                continue
 
             try:
                 events = decode_line(line, extract_payload, decoder,
@@ -513,8 +517,7 @@ def run_receiver(
                 elif routed != "":
                     print(routed)
 
-        if rx_mode != "stream":
-            time.sleep(poll_interval)
+        time.sleep(poll_interval)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -530,10 +533,7 @@ DEFAULT_BW = 2
 DEFAULT_SF = 7
 DEFAULT_POWER = 20
 DEFAULT_CR = 1
-# Radio-level CRC ON: with it off, the radio delivers bit-flipped frames
-# instead of dropping them, and the app layer wastes UART bandwidth and log
-# space on garbage that fails the packet CRC anyway. MUST match the sender.
-DEFAULT_CRC = 1
+DEFAULT_CRC = 0
 DEFAULT_HEADER = 0
 DEFAULT_IQ = 0
 DEFAULT_PREAMBLE = 8
@@ -645,13 +645,13 @@ def build_parser():
     parser.add_argument("--rx-timeout", type=int, default=DEFAULT_RX_TIMEOUT,
                         help="RX window in seconds or 65535 always open")
     parser.add_argument("--rx-ack", type=int, default=DEFAULT_RX_ACK, help="ACK mode 0/1/2")
-    parser.add_argument("--recv-format", type=int, choices=(0, 1), default=0,
-                        help="AT+RECV format 0=hex 1=text")
     parser.add_argument("--rx-mode", choices=("stream", "poll"), default="stream",
                         help="stream: read the modem's unsolicited RX output "
-                             "continuously (LA66 prints every frame on its own; "
-                             "no AT+RECV polling, half the modem UART traffic). "
+                             "(each frame crosses the modem UART once — "
+                             "required for reliable batch reception). "
                              "poll: legacy AT+RECV polling.")
+    parser.add_argument("--recv-format", type=int, choices=(0, 1), default=0,
+                        help="AT+RECV format 0=hex 1=text (poll mode only)")
     parser.add_argument("--poll", type=float, default=0.15,
                         help="Seconds between AT+RECV polls. Keep this well "
                              "under the sender's per-frame interval: if the "
@@ -702,12 +702,12 @@ def main(argv=None):
                 recv_format=args.recv_format,
                 poll_interval=args.poll,
                 wait=0.15,
-                rx_mode=args.rx_mode,
                 show_raw=args.show_raw,
                 handlers=build_handlers(args),
                 sinks=build_sinks(args, influx_writer=influx_writer),
                 log_prefix="receiver",
                 ascii_fallback=not args.no_ascii_fallback,
+                rx_mode=args.rx_mode,
             )
     finally:
         if influx_writer is not None:
