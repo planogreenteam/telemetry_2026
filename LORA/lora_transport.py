@@ -87,6 +87,18 @@ def try_probe_modem(ser):
 
 def open_serial(port, baud):
     ser = serial.Serial(port, baud, timeout=0.5)
+    # Grow the OS/driver receive buffer (Windows honors this; other
+    # platforms may not expose it — harmless either way). At 9600 baud the
+    # link delivers ~960 bytes/s, so 128 KiB buys roughly two minutes of
+    # cushion: if the Python process gets starved for CPU (memory
+    # pressure, console I/O stalls), arriving characters queue in the
+    # driver instead of being dropped — dropped characters are what turn
+    # clean modem output into torn hex ('cd4', truncated batch frames)
+    # that fails CRC and counts as packet loss.
+    try:
+        ser.set_buffer_size(rx_size=131072, tx_size=16384)
+    except (AttributeError, ValueError, OSError, NotImplementedError):
+        pass
     time.sleep(2.0)  # LA66 needs ~2s to boot before accepting AT commands
     ser.reset_input_buffer()
     ser.reset_output_buffer()
