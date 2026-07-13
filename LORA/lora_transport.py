@@ -144,14 +144,25 @@ class LoRaTransport:
         self.rx_timeout = rx_timeout
         self.rx_ack = rx_ack
         self.serial = None
-        # Minimum spacing between AT+SEND commands. The RECEIVER's modem
-        # prints every received frame as a ~130-char hex dump over its
-        # 9600-baud UART (~140 ms of serial time per frame); transmitting
-        # faster than it can print overflows its output buffer and the
-        # ground station sees spliced/truncated hex — i.e. corrupt packets
-        # even when the RF link is perfect.
-        self.min_send_gap = 0.15
+        # Pacing between AT+SEND commands. The RECEIVER's modem prints every
+        # received frame as a "Data: (HEX:) xx xx ..." dump over its
+        # 9600-baud UART (~1 ms per character, 3 chars printed per payload
+        # byte, plus prefix and Rssi lines); transmitting faster than it can
+        # print overflows its output buffer and the ground station sees
+        # spliced/truncated hex — i.e. corrupt packets even when the RF link
+        # is perfect. A FLAT gap gets this wrong in both directions: too
+        # long for a small BMV packet (~40 ms of print time), too short for
+        # a 4-packet batch (~400+ ms). So the gap scales with payload size:
+        #     gap = send_gap_base + len(payload_hex) * send_gap_per_hex_char
+        # 2 ms per hex char ≈ the receiver's real print cost (1.5 chars
+        # printed per hex char at ~1.04 ms/char) plus margin for the prefix
+        # and Rssi lines. Assumes the receiver runs in STREAM mode (each
+        # frame printed once); if it still polls AT+RECV too, every frame
+        # prints twice and per_hex_char should be doubled.
+        self.send_gap_base = 0.05
+        self.send_gap_per_hex_char = 0.002
         self._last_send_done = 0.0
+        self._last_send_hex_chars = 0
         # Buffer for unsolicited RX output (stream mode) — holds partial
         # lines between reads so a hex dump is never sliced mid-line.
         self._rx_buf = bytearray()
@@ -213,11 +224,18 @@ class LoRaTransport:
 
     def send_hex(self, payload_hex):
         ser = self._require_serial()
-        # Pace sends so the receiver's modem UART can drain between frames
-        # (see min_send_gap comment in __init__).
-        gap = self.min_send_gap - (time.monotonic() - self._last_send_done)
+        # Pace sends so the receiver's modem UART finishes printing the
+        # PREVIOUS frame before this one lands — so the wait is sized by
+        # the last payload sent (that's what the receiver is still
+        # printing), not the current one. A small BMV packet following a
+        # big CAN batch waits ~0.5 s; a packet following a small packet
+        # waits ~0.1 s.
+        required_gap = (self.send_gap_base
+                        + self._last_send_hex_chars * self.send_gap_per_hex_char)
+        gap = required_gap - (time.monotonic() - self._last_send_done)
         if gap > 0:
             time.sleep(gap)
+        self._last_send_hex_chars = len(payload_hex)
         try:
             lines = require_ok(
                 ser,
