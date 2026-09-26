@@ -67,10 +67,14 @@ class BMVTransmitPolicy:
         return seq
 
     def _charge_state_changed(self, reading):
-        return (
-            reading["fields"].get("charge_state")
-            != self.last_sent["fields"].get("charge_state")
-        )
+        # charge_state is SOC in 0.1 % steps but goes on the wire as a
+        # whole-percent byte, so compare whole percents — otherwise every
+        # 0.1 % tick sent a THRESHOLD_CROSSING the receiver couldn't see.
+        def whole(fields):
+            value = fields.get("charge_state")
+            return None if value is None else int(round(value))
+
+        return whole(reading["fields"]) != whole(self.last_sent["fields"])
 
     def _changed_enough(self, reading):
         current_fields = reading["fields"]

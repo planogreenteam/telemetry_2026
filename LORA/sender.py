@@ -9,22 +9,27 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+from LORA import radio_config as radio
 from LORA.lora_transport import LoRaTransport
 
 DEFAULT_PORT = "/dev/tty.usbserial-0002"
 DEFAULT_BAUD = 9600
-DEFAULT_FREQ = "868.100"
-DEFAULT_BW = 0
-DEFAULT_SF = 12
-DEFAULT_POWER = 20
-DEFAULT_CR = 1
-DEFAULT_CRC = 0
-DEFAULT_HEADER = 0
-DEFAULT_IQ = 0
-DEFAULT_PREAMBLE = 8
-DEFAULT_SYNCWORD = 0
-DEFAULT_GROUP = 0
-DEFAULT_ACK = 2
+# Radio settings come from the shared config so this test tool can talk to
+# telemetry_receiver.py out of the box.
+DEFAULT_FREQ = radio.FREQ
+DEFAULT_BW = radio.BW
+DEFAULT_SF = radio.SF
+DEFAULT_POWER = radio.POWER
+DEFAULT_CR = radio.CR
+DEFAULT_CRC = radio.CRC
+DEFAULT_HEADER = radio.HEADER
+DEFAULT_IQ = radio.IQ
+DEFAULT_PREAMBLE = radio.PREAMBLE
+DEFAULT_SYNCWORD = radio.SYNCWORD
+DEFAULT_GROUP = radio.GROUP
+# The receiver runs with RX ACK off, so waiting for an ACK would always
+# report failure.
+DEFAULT_ACK = 0
 DEFAULT_RETRIES = 3
 DEFAULT_SEND_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY = 2.0

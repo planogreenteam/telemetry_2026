@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""SocketCAN reader for the telemetry pipeline.
+"""SocketCAN reader for the MPPTs.
 
 read_frame() returns (kind, raw_frame_dict) tuples where `kind` is one of
-the strings in the id_to_kind mapping passed at construction time (e.g.
-"mppt" / "bms"). The normalizer for that kind decodes the bytes into named
-fields.
+the strings in the id_to_kind mapping passed at construction time (today
+only "mppt" — the BMS moved to RS485, see BMS/). The normalizer for that
+kind decodes the bytes into named fields.
 
 The reader applies kernel-level CAN filters built from id_to_kind, so frames
 with unmapped IDs never reach Python — important on a 125 kbps bus that
@@ -18,9 +18,6 @@ Pi setup recap:
     At runtime (matches the TPEE 125 kbps default):
         sudo ip link set can0 up type can bitrate 125000
         sudo ifconfig can0 txqueuelen 1000
-
-If your BMS is on its own 500 kbps bus and the MPPTs share a 125 kbps bus,
-run two separate CANReaders pointing at can0 and can1.
 """
 
 import can
@@ -33,11 +30,9 @@ class CANReader:
         interface:    SocketCAN device name, e.g. "can0".
         bitrate:      informational for SocketCAN (the kernel decides), but
                       python-can records it. 125000 matches the TPEE
-                      standard noted in their wiki; the Pylontech-style BMS
-                      protocol uses 500000 — if both live on the same bus,
-                      pick one and live with it (everyone has to agree).
+                      standard noted in their wiki.
         id_to_kind:   dict mapping CAN ID (int) -> kind string.
-                      e.g. {0x20: "mppt", 0x21: "mppt", 0x351: "bms", ...}
+                      e.g. {0x20: "mppt", 0x21: "mppt", ...}
                       Frames whose IDs aren't in this dict are dropped at
                       the kernel filter level.
         bustype:      python-can interface name, default "socketcan".
