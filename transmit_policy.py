@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Field-delta-based transmit policy for CAN-derived telemetry.
+"""Field-delta-based transmit policy shared by the MPPT (CAN) and BMS (RS485)
+streams.
 
 Matches the contract the BMV policy provides (classify / mark_sent), but
 generalised:
@@ -9,13 +10,10 @@ generalised:
     source key defaults to device_id, which is what the MPPT normalizer
     increments per board.
 
-  - Tracks state per "frame kind" for BMSes, because different CAN IDs
-    from one BMS pack carry different fields (SOC on 0x355, voltage on
-    0x356) — comparing 0x355's SOC against the 0x356 reading we last
-    stored would be a category error. Within a single source, each
-    *can_id_hex* gets its own slot. If the reading has no can_id_hex
-    (MPPT case — already collapsed into one frame per board), it uses
-    a default slot per source.
+  - Within a source, tracks state per packet_id, because an MPPT's power
+    (0) and status (1) frames carry disjoint fields. Readings without a
+    packet_id (the BMS: one Modbus poll is one complete snapshot) use a
+    single slot per source.
 
 Configurable per-field deltas: when ANY watched field has moved by at
 least its delta since the last send (or any field appears that didn't
@@ -60,16 +58,11 @@ class GenericTransmitPolicy:
         # overwrite each other's last-sent state and the delta thresholds are
         # never meaningfully compared.
         #
-        #   - BMS: different CAN IDs carry different fields (SOC on 0x355,
-        #     voltage on 0x356), keyed by can_id_hex.
         #   - MPPT: power (packet_id 0) and status (packet_id 1) frames carry
         #     disjoint fields and arrive at different rates; keyed by packet_id.
-        #   - Anything else collapses to a single slot per source.
+        #   - Anything else (BMS) collapses to a single slot per source.
         src = reading["device_id"]
-        fields = reading["fields"]
-        if "can_id_hex" in fields:
-            slot = fields["can_id_hex"]
-        elif reading.get("packet_id") is not None:
+        if reading.get("packet_id") is not None:
             slot = f"pkt{reading['packet_id']}"
         else:
             slot = "_only"

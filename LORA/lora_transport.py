@@ -163,7 +163,9 @@ class LoRaTransport:
 
                 return self
 
-            except RuntimeError as exc:
+            # OSError covers serial.SerialException: the USB modem not yet
+            # enumerated at boot is exactly the case worth retrying.
+            except (RuntimeError, OSError) as exc:
                 print(f"[lora] Modem init attempt {attempt}/{max_attempts} failed: {exc}")
                 if attempt < max_attempts:
                     time.sleep(3.0)

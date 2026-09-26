@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode raw CAN frames into named engineering units.
+"""Decode raw TPEE MPPT CAN frames into named engineering units.
 
 TPEE Open-SEC CAN protocol — authoritative source: OpenSEC Manual V1.9
 
@@ -31,7 +31,6 @@ import time
 # shift right 4 bits. e.g. 0x020 >> 4 = 2, 0x100 >> 4 = 16.
 # ─────────────────────────────────────────────────────────────────────────────
 
-MPPT_EFFECTIVE_IDS = [1, 3, 4, 5, 6, 17]
 MPPT_EFFECTIVE_IDS = [17, 1, 3, 4, 5, 6]
 
 
@@ -154,100 +153,13 @@ def normalize_mppt_frame(raw_frame, device_id):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BMS — EG4 LL-S in P06-LUX (Pylontech-compatible) mode
-# ─────────────────────────────────────────────────────────────────────────────
-
-BMS_LIMITS_ID    = 0x351
-BMS_SOC_SOH_ID   = 0x355
-BMS_LIVE_ID      = 0x356
-BMS_ALARMS_ID    = 0x359
-BMS_CHARGE_FLAGS = 0x35C
-BMS_MFR_NAME_ID  = 0x35E
-
-BMS_IDS = frozenset({
-    BMS_LIMITS_ID, BMS_SOC_SOH_ID, BMS_LIVE_ID,
-    BMS_ALARMS_ID, BMS_CHARGE_FLAGS, BMS_MFR_NAME_ID,
-})
-
-
-def _u16_le(data, offset):
-    return struct.unpack_from("<H", data, offset)[0]
-
-
-def _s16_le(data, offset):
-    return struct.unpack_from("<h", data, offset)[0]
-
-
-def normalize_bms_frame(raw_frame, device_id):
-    """Decode one Pylontech-style BMS frame."""
-    can_id = raw_frame["can_id"]
-    data = bytes(raw_frame["data"])
-    if can_id not in BMS_IDS:
-        raise ValueError(f"normalize_bms_frame got non-BMS id 0x{can_id:X}")
-
-    pad = data + b"\x00" * (8 - len(data)) if len(data) < 8 else data
-    fields = {"can_id_hex": f"0x{can_id:X}"}
-
-    if can_id == BMS_LIMITS_ID:
-        fields.update({
-            "charge_voltage_v":    _u16_le(pad, 0) * 0.1,
-            "charge_current_a":    _s16_le(pad, 2) * 0.1,
-            "discharge_current_a": _s16_le(pad, 4) * 0.1,
-            "discharge_voltage_v": _u16_le(pad, 6) * 0.1,
-        })
-    elif can_id == BMS_SOC_SOH_ID:
-        fields.update({
-            "soc_pct": _u16_le(pad, 0),
-            "soh_pct": _u16_le(pad, 2),
-        })
-    elif can_id == BMS_LIVE_ID:
-        fields.update({
-            "battery_voltage_v": _s16_le(pad, 0) * 0.01,
-            "battery_current_a": _s16_le(pad, 2) * 0.1,
-            "battery_temp_c":    _s16_le(pad, 4) * 0.1,
-        })
-    elif can_id == BMS_ALARMS_ID:
-        fields.update({
-            "protection_flags": _u16_le(pad, 0),
-            "alarm_flags":      _u16_le(pad, 2),
-            "module_count":     pad[4],
-        })
-    elif can_id == BMS_CHARGE_FLAGS:
-        b0 = pad[0]
-        fields.update({
-            "charge_enable":      int(bool(b0 & 0x80)),
-            "discharge_enable":   int(bool(b0 & 0x40)),
-            "force_charge_req_1": int(bool(b0 & 0x20)),
-            "force_charge_req_2": int(bool(b0 & 0x10)),
-        })
-    elif can_id == BMS_MFR_NAME_ID:
-        try:
-            mfr = pad.decode("ascii", errors="replace").strip()
-        except Exception:
-            mfr = pad.hex()
-        fields["manufacturer"] = mfr
-
-    fields["raw_hex"] = pad.hex()
-
-    return {
-        "device_type": "bms",
-        "device_id":   device_id,
-        "timestamp":   int(raw_frame.get("rx_timestamp") or time.time()),
-        "fields":      fields,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Convenience: default id_to_kind mapping for the CANReader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def default_id_to_kind(num_mppts=None):
-    """Build the {can_id: kind} dict from MPPT_EFFECTIVE_IDS + BMS_IDS.
-
-    num_mppts is ignored — all IDs in MPPT_EFFECTIVE_IDS are always included.
-    The parameter is kept for backwards compatibility only.
-    """
-    mapping = {can_id: "bms" for can_id in BMS_IDS}
+def default_id_to_kind():
+    """Build the {can_id: kind} dict for the CANReader from MPPT_EFFECTIVE_IDS.
+    The BMS is no longer on CAN (it is read over RS485 — see BMS/)."""
+    mapping = {}
     for eid in MPPT_EFFECTIVE_IDS:
         mapping[(eid << 4) | 0] = "mppt"  # power frame
         mapping[(eid << 4) | 1] = "mppt"  # status frame

@@ -1,2 +1,4 @@
 pyserial
+python-can
+influxdb-client
 pyinstaller

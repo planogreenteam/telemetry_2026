@@ -1,48 +1,49 @@
 #!/usr/bin/env python3
-import csv
+"""Ground-station CSV: one row per decoded packet, all message types."""
+
 from datetime import datetime, timezone
-from pathlib import Path
+
+from storage.csv_sink import open_csv_writer
+from telemetry_packet import MsgType, layout_field_names
 
 
-EVENT_CSV_HEADERS = (
+_META_HEADERS = (
     "received_at",
     "packet_timestamp",
     "msg_type",
     "event_type",
     "device_id",
     "seq",
-    "voltage_mv",
-    "current_ma",
-    "power_w",
-    "charge_state",
-    "alarm",
 )
 
 
+def _all_field_names():
+    names = []
+    for msg_type in MsgType:
+        for name in layout_field_names(msg_type):
+            if name not in names:
+                names.append(name)
+    return tuple(names)
+
+
+# Every field any packet type can carry, so BMV, MPPT and BMS rows all
+# land in one file with a stable header.
+EVENT_CSV_HEADERS = _META_HEADERS + _all_field_names()
+
+_writers = {}
+
+
 def write_event_csv(csv_path, event):
-    csv_path = Path(csv_path)
-    file_exists = csv_path.exists()
+    csv_file, writer = open_csv_writer(csv_path, EVENT_CSV_HEADERS, cache=_writers)
 
-    with csv_path.open("a", newline="") as csv_file:
-        writer = csv.writer(csv_file)
-        if not file_exists or csv_path.stat().st_size == 0:
-            writer.writerow(EVENT_CSV_HEADERS)
-
-        fields = event.get("fields", {})
-        packet_timestamp = datetime.fromtimestamp(event["timestamp"], tz=timezone.utc).isoformat()
-        writer.writerow(
-            [
-                datetime.now(timezone.utc).isoformat(),
-                packet_timestamp,
-                event["msg_type"].name,
-                event["event_type"].name,
-                event["device_id"],
-                event["seq"],
-                fields.get("voltage_mv"),
-                fields.get("current_ma"),
-                fields.get("power_w"),
-                fields.get("charge_state"),
-                fields.get("alarm"),
-            ]
-        )
-        csv_file.flush()
+    row = dict(event.get("fields", {}))
+    row.update({
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "packet_timestamp": datetime.fromtimestamp(event["timestamp"], tz=timezone.utc).isoformat(),
+        "msg_type": event["msg_type"].name,
+        "event_type": event["event_type"].name,
+        "device_id": event["device_id"],
+        "seq": event["seq"],
+    })
+    writer.writerow(row)
+    csv_file.flush()

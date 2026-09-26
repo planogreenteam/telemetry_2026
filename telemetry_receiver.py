@@ -19,8 +19,10 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+from BMS.bms_handler import format_bms_packet
 from BMV.bmv_handler import format_bmv_packet
-from CAN.can_handler import format_mppt_packet, format_bms_packet
+from CAN.can_handler import format_mppt_packet
+from LORA import radio_config as radio
 from LORA.lora_transport import LoRaTransport, extract_hex_payload
 from storage.event_csv_sink import write_event_csv
 from telemetry_packet import MsgType, decode_packet, is_batch, split_batch
@@ -145,16 +147,6 @@ class InfluxWriter:
             self.client.close()
         except Exception:
             pass
-
-
-def make_influx_sink(writer: InfluxWriter, tags: dict):
-    # Legacy synchronous sink — writes inline in the caller's thread.
-    # The receiver now uses AsyncInfluxSink instead so a slow/dead Influx
-    # can never stall the modem polling loop. Kept for any external code
-    # importing it directly.
-    def _sink(event: dict):
-        writer.write(event, tags=tags)
-    return _sink
 
 
 class AsyncInfluxSink:
@@ -527,28 +519,40 @@ def run_receiver(
 DEFAULT_TRANSPORT = "lora"
 DEFAULT_PORT = "COM4"
 DEFAULT_BAUD = 9600
-DEFAULT_FREQ = "868.100"
-# BW 2 = 500 kHz — MUST match telemetry_sender.py DEFAULT_BW.
-DEFAULT_BW = 2
-DEFAULT_SF = 7
-DEFAULT_POWER = 20
-DEFAULT_CR = 1
-DEFAULT_CRC = 0
-DEFAULT_HEADER = 0
-DEFAULT_IQ = 0
-DEFAULT_PREAMBLE = 8
-DEFAULT_SYNCWORD = 0
-DEFAULT_GROUP = 0
 DEFAULT_RX_TIMEOUT = 65535
 DEFAULT_RX_ACK = 0
 DEFAULT_CSV_PATH = "received_events.csv"
 
+def _load_dotenv():
+    """Load KEY=VALUE lines from a git-ignored .env file (current directory
+    first, then next to this script) into os.environ, without overriding
+    variables that are already set. This keeps secrets such as the InfluxDB
+    token out of the source code."""
+    candidates = [os.path.join(os.getcwd(), ".env"),
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")]
+    for path in dict.fromkeys(candidates):
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
 DEFAULT_INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
-DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "C_pCeeM8QagSy6FqWRpYR2ZQeNLr5yxAewGfa0Kdm5jnPBy_Dpf3cD-UMLqQ4A7etWLDCkJi3r_B69EjqHs8AA==")
+DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
 DEFAULT_INFLUX_ORG = os.getenv("INFLUX_ORG", "my-org")
 DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "Default-data")
 DEFAULT_INFLUX_BUCKET_BMV = os.getenv("INFLUX_BUCKET_BMV", "BMV-data")
 DEFAULT_INFLUX_BUCKET_CAN = os.getenv("INFLUX_BUCKET_CAN", "CAN-data")
+# The BMS used to arrive over CAN and was stored with the MPPTs; it keeps
+# that bucket by default so no new bucket has to exist in Influx.
+DEFAULT_INFLUX_BUCKET_BMS = os.getenv("INFLUX_BUCKET_BMS", DEFAULT_INFLUX_BUCKET_CAN)
 DEFAULT_INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "telemetry")
 
 
@@ -606,14 +610,15 @@ def build_influx_writer(args):
     if not args.influx_enable:
         return None
     if not args.influx_token:
-        print("[influx] --influx-enable set but no token provided "
-              "(use --influx-token or INFLUX_TOKEN env var). Skipping InfluxDB.")
+        print("[influx] No InfluxDB token provided (put INFLUX_TOKEN=... in "
+              "a .env file, set the INFLUX_TOKEN env var, or pass "
+              "--influx-token). Skipping InfluxDB.")
         return None
 
     bucket_map = {
         MsgType.BMV:  args.influx_bucket_bmv,
         MsgType.MPPT: args.influx_bucket_can,
-        MsgType.BMS:  args.influx_bucket_can,
+        MsgType.BMS:  args.influx_bucket_bms,
     }
 
     return InfluxWriter(
@@ -631,17 +636,17 @@ def build_parser():
     parser.add_argument("--transport", choices=("lora",), default=DEFAULT_TRANSPORT)
     parser.add_argument("--port", default=DEFAULT_PORT, help="Serial device path")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Serial baud rate")
-    parser.add_argument("--freq", default=DEFAULT_FREQ, help="TX/RX frequency in MHz, e.g. 868.100")
-    parser.add_argument("--bw", type=int, default=DEFAULT_BW, help="Bandwidth enum 0-9")
-    parser.add_argument("--sf", type=int, default=DEFAULT_SF, help="Spreading factor 5-12")
-    parser.add_argument("--power", type=int, default=DEFAULT_POWER, help="TX power 0-22 dBm")
-    parser.add_argument("--cr", type=int, default=DEFAULT_CR, help="Coding rate 1-4")
-    parser.add_argument("--crc", type=int, default=DEFAULT_CRC, help="CRC 0=off 1=on")
-    parser.add_argument("--header", type=int, default=DEFAULT_HEADER, help="Header 0=explicit 1=implicit")
-    parser.add_argument("--iq", type=int, default=DEFAULT_IQ, help="IQ invert 0=standard 1=inverted")
-    parser.add_argument("--preamble", type=int, default=DEFAULT_PREAMBLE, help="Preamble length")
-    parser.add_argument("--syncword", type=int, default=DEFAULT_SYNCWORD, help="Sync word mode 0/1")
-    parser.add_argument("--group", type=int, default=DEFAULT_GROUP, help="Group 0-255")
+    parser.add_argument("--freq", default=radio.FREQ, help="TX/RX frequency in MHz, e.g. 868.100")
+    parser.add_argument("--bw", type=int, default=radio.BW, help="Bandwidth enum 0-9")
+    parser.add_argument("--sf", type=int, default=radio.SF, help="Spreading factor 5-12")
+    parser.add_argument("--power", type=int, default=radio.POWER, help="TX power 0-22 dBm")
+    parser.add_argument("--cr", type=int, default=radio.CR, help="Coding rate 1-4")
+    parser.add_argument("--crc", type=int, default=radio.CRC, help="CRC 0=off 1=on")
+    parser.add_argument("--header", type=int, default=radio.HEADER, help="Header 0=explicit 1=implicit")
+    parser.add_argument("--iq", type=int, default=radio.IQ, help="IQ invert 0=standard 1=inverted")
+    parser.add_argument("--preamble", type=int, default=radio.PREAMBLE, help="Preamble length")
+    parser.add_argument("--syncword", type=int, default=radio.SYNCWORD, help="Sync word mode 0/1")
+    parser.add_argument("--group", type=int, default=radio.GROUP, help="Group 0-255")
     parser.add_argument("--rx-timeout", type=int, default=DEFAULT_RX_TIMEOUT,
                         help="RX window in seconds or 65535 always open")
     parser.add_argument("--rx-ack", type=int, default=DEFAULT_RX_ACK, help="ACK mode 0/1/2")
@@ -680,7 +685,10 @@ def build_parser():
     parser.add_argument("--influx-bucket-bmv", default=DEFAULT_INFLUX_BUCKET_BMV,
                         help="InfluxDB bucket for BMV packets (env: INFLUX_BUCKET_BMV)")
     parser.add_argument("--influx-bucket-can", default=DEFAULT_INFLUX_BUCKET_CAN,
-                        help="InfluxDB bucket for MPPT and BMS packets (env: INFLUX_BUCKET_CAN)")
+                        help="InfluxDB bucket for MPPT packets (env: INFLUX_BUCKET_CAN)")
+    parser.add_argument("--influx-bucket-bms", default=DEFAULT_INFLUX_BUCKET_BMS,
+                        help="InfluxDB bucket for BMS packets (env: INFLUX_BUCKET_BMS, "
+                             "defaults to the MPPT bucket)")
     parser.add_argument("--influx-measurement", default=DEFAULT_INFLUX_MEASUREMENT,
                         help="InfluxDB measurement name (env: INFLUX_MEASUREMENT)")
     return parser
