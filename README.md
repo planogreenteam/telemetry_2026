@@ -160,7 +160,7 @@ python3 telemetry_receiver.py --port COM4                        # Windows (defa
 ```
 Each packet is printed, for example:
 ```
-[rx:bms] SOC=87% event=DELTA_UPDATE device=20 seq=7 ...
+[rx:bms] event=DELTA_UPDATE device=20 seq=7 ... fields={'battery_voltage_v': 53.0, 'remaining_ah': 85.0, ...}
 ```
 If packets are lost, the receiver prints a `seq gap` line with the running loss percentage for the session.
 
