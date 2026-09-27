@@ -97,11 +97,15 @@ Plug in the Victron VE.Direct USB cable. The default port in `telemetry_sender.p
    - Take the A/B (and GND) pins from the EG4 manual's pinout for the RS485 port.
    - **If A and B are swapped, the battery never answers.** Swapping them causes no damage, so it's the first thing to try.
 2. **Address.** The battery's DIP switches set its Modbus address. A single battery is normally 1. Pass it as `--bms-address`.
-3. **Port.** Put the adapter's `/dev/serial/by-id/...` path in `DEFAULT_BMS_PORT` in `telemetry_sender.py`, or pass `--bms-port`. The committed default is a placeholder.
+3. **Port.** The team's FTDI FT232R adapter is the default (`DEFAULT_BMS_PORT` in `telemetry_sender.py`): `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A994Y1KM-if00-port0`. It works in any USB port. If you swap in a different adapter, find its path with `ls /dev/serial/by-id/` and update `DEFAULT_BMS_PORT` or pass `--bms-port`.
 4. **Verify the register map before trusting the data.** EG4 doesn't publish the map in `BMS/bms_normalizer.py`; it comes from community drivers.
    ```bash
-   python3 -m BMS.bms_probe --port /dev/serial/by-id/<adapter> --scan         # which address answers?
-   python3 -m BMS.bms_probe --port /dev/serial/by-id/<adapter> --address 1    # raw dump + decoded values
+   python3 -m BMS.bms_probe --scan         # which address answers?
+   python3 -m BMS.bms_probe --address 1    # raw dump + decoded values
+   ```
+   The probe uses the same adapter as the sender by default. Add `--port COM5` (or another path) to use a different one:
+   ```bash
+   python3 -m BMS.bms_probe --port COM5 --scan
    ```
    - Compare the decoded SOC, pack voltage and cell voltages with the battery's display or the EG4 app. If a value is in the wrong place, edit the `REG` table in `BMS/bms_normalizer.py`.
    - If discharge shows as a **positive** current, set `CURRENT_SIGN = -1`. The rest of the system expects discharge to be negative.
@@ -134,7 +138,7 @@ python3 telemetry_sender.py
 By default (`--device all`) it opens every device it can find and skips any whose hardware is missing, logging why. To run one device on its own:
 ```bash
 python3 telemetry_sender.py --device bmv
-python3 telemetry_sender.py --device bms --bms-port /dev/serial/by-id/<adapter> --bms-address 1
+python3 telemetry_sender.py --device bms --bms-address 1
 python3 telemetry_sender.py --device can
 ```
 To read the hardware and print the packets instead of transmitting (no radio needed):

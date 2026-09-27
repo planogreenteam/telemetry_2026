@@ -5,10 +5,13 @@ Use this BEFORE trusting the telemetry to confirm the wiring, the address
 and the register map in BMS/bms_normalizer.py.
 
     # Which address answers? (tries 1..16)
-    python -m BMS.bms_probe --port /dev/serial/by-id/usb-... --scan
+    python -m BMS.bms_probe --scan
 
     # Raw register dump + decoded view for one address
-    python -m BMS.bms_probe --port /dev/serial/by-id/usb-... --address 1
+    python -m BMS.bms_probe --address 1
+
+--port defaults to the team's adapter (DEFAULT_BMS_PORT in
+telemetry_sender.py); pass it for a different adapter or a COM port.
 
 Compare the decoded SOC / pack voltage / cells with the battery's display
 or the EG4 app. If a value is in the wrong register, edit REG in
@@ -27,6 +30,7 @@ from BMS.bms_normalizer import (  # noqa: E402
     REG, REGISTER_BLOCK_COUNT, REGISTER_BLOCK_START, normalize_bms_frame,
 )
 from BMS.bms_reader import EG4ModbusReader, ModbusError  # noqa: E402
+from telemetry_sender import DEFAULT_BMS_PORT  # noqa: E402
 
 # Read the wider dump in chunks: some BMS firmware rejects big requests.
 DUMP_CHUNK = 32
@@ -83,7 +87,9 @@ def decoded(reader):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="EG4 LL-S RS485/Modbus probe")
-    parser.add_argument("--port", required=True, help="USB-RS485 adapter serial device")
+    parser.add_argument("--port", default=DEFAULT_BMS_PORT,
+                        help="USB-RS485 adapter serial device (default: the "
+                             "team's adapter, same as telemetry_sender.py)")
     parser.add_argument("--baud", type=int, default=9600)
     parser.add_argument("--address", type=int, default=1, help="Battery DIP address")
     parser.add_argument("--scan", action="store_true", help="Try addresses 1..16 and stop")
