@@ -550,9 +550,8 @@ DEFAULT_INFLUX_ORG = os.getenv("INFLUX_ORG", "my-org")
 DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "Default-data")
 DEFAULT_INFLUX_BUCKET_BMV = os.getenv("INFLUX_BUCKET_BMV", "BMV-data")
 DEFAULT_INFLUX_BUCKET_CAN = os.getenv("INFLUX_BUCKET_CAN", "CAN-data")
-# The BMS used to arrive over CAN and was stored with the MPPTs; it keeps
-# that bucket by default so no new bucket has to exist in Influx.
-DEFAULT_INFLUX_BUCKET_BMS = os.getenv("INFLUX_BUCKET_BMS", DEFAULT_INFLUX_BUCKET_CAN)
+# RS485 BMS data (EG4 LL-S) gets its own bucket.
+DEFAULT_INFLUX_BUCKET_BMS = os.getenv("INFLUX_BUCKET_BMS", "BMS-data")
 DEFAULT_INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "telemetry")
 
 
@@ -687,8 +686,7 @@ def build_parser():
     parser.add_argument("--influx-bucket-can", default=DEFAULT_INFLUX_BUCKET_CAN,
                         help="InfluxDB bucket for MPPT packets (env: INFLUX_BUCKET_CAN)")
     parser.add_argument("--influx-bucket-bms", default=DEFAULT_INFLUX_BUCKET_BMS,
-                        help="InfluxDB bucket for BMS packets (env: INFLUX_BUCKET_BMS, "
-                             "defaults to the MPPT bucket)")
+                        help="InfluxDB bucket for BMS packets (env: INFLUX_BUCKET_BMS)")
     parser.add_argument("--influx-measurement", default=DEFAULT_INFLUX_MEASUREMENT,
                         help="InfluxDB measurement name (env: INFLUX_MEASUREMENT)")
     return parser
