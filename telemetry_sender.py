@@ -62,10 +62,11 @@ DEFAULT_CURRENT_DELTA_MA = 200
 DEFAULT_POWER_DELTA_W = 10
 DEFAULT_HEARTBEAT_SECONDS = 3
 
-# BMS (EG4 LL-S over RS485). Find the real port with `ls /dev/serial/by-id/`
-# with only the RS485 adapter plugged in, and put it here or pass
-# --bms-port. by-id paths don't swap between boots like /dev/ttyUSB* do.
-DEFAULT_BMS_PORT = "/dev/serial/by-id/usb-RS485-adapter-CHANGE-ME-if00-port0"
+# BMS (EG4 LL-S over RS485): the team's FTDI FT232R USB-RS485 adapter.
+# The by-id path comes from the adapter's own serial number (A994Y1KM), so
+# it works in any USB port and never swaps like /dev/ttyUSB* can. A
+# different adapter needs its own path (`ls /dev/serial/by-id/`).
+DEFAULT_BMS_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A994Y1KM-if00-port0"
 DEFAULT_BMS_BAUD = 9600
 DEFAULT_BMS_ADDRESS = 1          # battery DIP-switch address
 DEFAULT_BMS_POLL_SECONDS = 1.0
