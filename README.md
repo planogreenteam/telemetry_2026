@@ -228,7 +228,7 @@ The receiver writes every packet to InfluxDB (v2) under the measurement `telemet
 | Org | `--influx-org` | `INFLUX_ORG` | `my-org` |
 | BMV bucket | `--influx-bucket-bmv` | `INFLUX_BUCKET_BMV` | `BMV-data` |
 | MPPT bucket | `--influx-bucket-can` | `INFLUX_BUCKET_CAN` | `CAN-data` |
-| BMS bucket | `--influx-bucket-bms` | `INFLUX_BUCKET_BMS` | same as the MPPT bucket |
+| BMS bucket | `--influx-bucket-bms` | `INFLUX_BUCKET_BMS` | `BMS-data` |
 | Other types | `--influx-bucket` | `INFLUX_BUCKET` | `Default-data` |
 
 **Token:** put it in a `.env` file in the directory you run the receiver from. The file is git-ignored.
