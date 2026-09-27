@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
-"""Decode an EG4 LL-S Modbus register block into named engineering units.
+"""Decode EG4 LL-S Modbus registers into named engineering units.
 
 ────────────────────────────────────────────────────────────────────
-REGISTER MAP — VERIFY AGAINST THE REAL BATTERY
+REGISTER MAP — from a bms_probe dump of the team's battery
 ────────────────────────────────────────────────────────────────────
-EG4 does not publish this map; it comes from community drivers for the
-EG4 LL family (the same protocol the EG4 "BMS Test" PC software uses).
-Before trusting it, run:
+Verified against the battery's own display (53.16 V, 0.0 A, 85 %):
 
-    python -m BMS.bms_probe --port <adapter> --address <DIP address>
+    reg 21        SOC, %                       85
+    reg 22        pack voltage, 0.01 V         5316  = 53.16 V (display 53.16)
+    reg 26        remaining capacity, 0.01 Ah  8500  = 85.00 Ah
+    reg 27        full capacity, 0.01 Ah       10000 = 100.00 Ah  (85/100 = SOC)
+    reg 37 / 38   highest / lowest cell, mV    3323 / 3322
+    reg 41        number of cells              16
+    reg 113..128  cells 1..16, mV              3322/3323 — they sum to 53.16 V
 
-and compare SOC, pack voltage and the cell voltages with the battery's
-own display / EG4 app. If anything is off, fix the numbers in REG below —
-nothing else in the pipeline needs to change.
+Probable, not yet proven (were 0 or unambiguous-looking in one dump):
 
-The normalizer also cross-checks itself at runtime: it warns if SOC is
-over 100 % or the sum of the cells disagrees with the pack voltage by
-more than 1 V, both of which mean this map is wrong.
+    reg 23        current, 0.01 A signed       0     (display 0.0 A) — confirm
+                                                     with the probe while current
+                                                     is flowing, and check the sign
+    reg 30        cycle count                  7
+    reg 32        state of health, %           100
+
+Not identified yet (logged raw to bms_data.csv as reg_NN so they can be
+matched later): 19 (97), 24 (36), 25 (5000), 28 (530), 33 (5600),
+35 (10000), 39 (8), 40 (8). Temperatures and the warning / protection /
+error flags are somewhere in here or in registers that read 0 with no
+alarm active, so they are NOT sent until identified — a wrong register
+there is worse than no value.
+
+To re-check: python3 -m BMS.bms_probe --address <DIP address>
 ────────────────────────────────────────────────────────────────────
 """
 
@@ -25,38 +38,37 @@ import time
 
 # Holding-register addresses (0-based). All registers are big-endian u16.
 REG = {
-    "pack_voltage":   0,    # 0.01 V
-    "current":        1,    # 0.01 A, signed (see CURRENT_SIGN)
-    "cell_first":     2,    # cells 1..16 in regs 2..17, mV
-    "temp_pcb":       18,   # °C, signed
-    "temp_max":       19,   # °C, signed
-    "temp_avg":       20,   # °C, signed
-    "remaining_ah":   21,   # Ah
-    "max_charge_a":   22,   # A (charge current limit)
-    "soh":            23,   # %
-    "soc":            24,   # %
-    "status":         25,   # bitfield / enum
-    "warning":        26,   # bitfield
-    "protection":     27,   # bitfield
-    "error":          28,   # error code
-    "cycle_hi":       29,   # cycle count, u32 high word
-    "cycle_lo":       30,   # cycle count, u32 low word
-    "full_ah":        31,   # full-charge capacity, Ah
+    "soc":            21,   # %
+    "pack_voltage":   22,   # 0.01 V
+    "current":        23,   # 0.01 A, signed (see CURRENT_SIGN) — probable
+    "remaining_ah":   26,   # 0.01 Ah
+    "full_ah":        27,   # 0.01 Ah
+    "cycle_count":    30,   # probable
+    "soh":            32,   # %, probable
+    "cell_count":     41,
+    "cell_first":     113,  # cells 1..16 in regs 113..128, mV
 }
 
 NUM_CELLS = 16
 
-# Registers fetched in one request by BMS/bms_reader.py.
-REGISTER_BLOCK_START = 0
-REGISTER_BLOCK_COUNT = 39
+# Registers read but not yet identified; logged raw for later mapping.
+UNIDENTIFIED_REGS = (19, 24, 25, 28, 33, 35, 39, 40)
+
+# (start, count) ranges fetched every poll by BMS/bms_reader.py. The reader
+# splits them into requests of at most 32 registers (sizes the probe has
+# confirmed the battery answers).
+REGISTER_BLOCKS = (
+    (0, 42),
+    (REG["cell_first"], NUM_CELLS),
+)
 
 # The rest of the pipeline (and the BMV) treats NEGATIVE current as
 # discharge — the drive timer starts on it. If the probe shows the battery
 # reporting discharge as positive, set this to -1.
 CURRENT_SIGN = 1
 
-# Cells reading below this are treated as "not fitted" (e.g. a pack with
-# fewer than 16 cells reports zeros) and left out of min/max/sum.
+# Cells reading below this are treated as "not fitted" and left out of
+# min/max/sum.
 MIN_VALID_CELL_MV = 1000
 
 _SANITY_WARN_INTERVAL = 60.0
@@ -77,13 +89,14 @@ def _sanity_warn(message):
 
 
 def normalize_bms_frame(raw_frame, device_id):
+    """raw_frame["registers"] is a {register_address: u16} dict."""
     regs = raw_frame["registers"]
-    if len(regs) < REGISTER_BLOCK_COUNT:
-        raise ValueError(f"BMS frame has {len(regs)} registers, "
-                         f"expected {REGISTER_BLOCK_COUNT}")
+    missing = [addr for addr in REG.values() if addr not in regs]
+    if missing:
+        raise ValueError(f"BMS frame is missing registers {missing}")
 
     first = REG["cell_first"]
-    cells_mv = regs[first:first + NUM_CELLS]
+    cells_mv = [regs.get(first + i, 0) for i in range(NUM_CELLS)]
     fitted = [(i + 1, mv) for i, mv in enumerate(cells_mv) if mv >= MIN_VALID_CELL_MV]
 
     pack_voltage_v = regs[REG["pack_voltage"]] / 100.0
@@ -92,18 +105,10 @@ def normalize_bms_frame(raw_frame, device_id):
         "battery_current_a": CURRENT_SIGN * _s16(regs[REG["current"]]) / 100.0,
         "soc_pct":           regs[REG["soc"]],
         "soh_pct":           regs[REG["soh"]],
-        "remaining_ah":      regs[REG["remaining_ah"]],
-        "full_capacity_ah":  regs[REG["full_ah"]],
-        "max_charge_a":      regs[REG["max_charge_a"]],
-        "cycle_count":       (regs[REG["cycle_hi"]] << 16) | regs[REG["cycle_lo"]],
-        "temp_pcb_c":        _s16(regs[REG["temp_pcb"]]),
-        "temp_max_c":        _s16(regs[REG["temp_max"]]),
-        "temp_avg_c":        _s16(regs[REG["temp_avg"]]),
-        "status":            regs[REG["status"]],
-        "warning_flags":     regs[REG["warning"]],
-        "protection_flags":  regs[REG["protection"]],
-        "error_code":        regs[REG["error"]],
-        "cell_count":        len(fitted),
+        "remaining_ah":      regs[REG["remaining_ah"]] / 100.0,
+        "full_capacity_ah":  regs[REG["full_ah"]] / 100.0,
+        "cycle_count":       regs[REG["cycle_count"]],
+        "cell_count":        regs[REG["cell_count"]],
     }
 
     if fitted:
@@ -121,12 +126,17 @@ def normalize_bms_frame(raw_frame, device_id):
         if abs(cell_sum_v - pack_voltage_v) > 1.0:
             _sanity_warn(f"cell sum {cell_sum_v:.2f} V != pack voltage "
                          f"{pack_voltage_v:.2f} V")
+    else:
+        _sanity_warn("no cell voltages found")
 
     if fields["soc_pct"] > 100:
         _sanity_warn(f"SOC reads {fields['soc_pct']} %")
 
     for i, mv in enumerate(cells_mv, start=1):
         fields[f"cell_{i:02d}_mv"] = mv
+    for addr in UNIDENTIFIED_REGS:
+        if addr in regs:
+            fields[f"reg_{addr}"] = regs[addr]
 
     return {
         "device_type": "bms",

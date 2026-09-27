@@ -45,7 +45,7 @@ BMV/   bmv_reader.py      VE.Direct text protocol reader (checksum-verified)
        bmv_handler.py     Receiver console formatter
 
 BMS/   bms_reader.py      Modbus RTU client for the EG4 battery (pyserial only)
-       bms_normalizer.py  Register map + decoding (SOC, cells, temps, flags)
+       bms_normalizer.py  Register map + decoding (SOC, voltage, current, capacity, cells)
        bms_probe.py       Bench tool: find the battery's address and dump/decode its registers
        bms_handler.py     Receiver console formatter
 
@@ -98,7 +98,12 @@ Plug in the Victron VE.Direct USB cable. The default port in `telemetry_sender.p
    - **If A and B are swapped, the battery never answers.** Swapping them causes no damage, so it's the first thing to try.
 2. **Address.** The battery's DIP switches set its Modbus address. A single battery is normally 1. Pass it as `--bms-address`.
 3. **Port.** The team's FTDI FT232R adapter is the default (`DEFAULT_BMS_PORT` in `telemetry_sender.py`): `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A994Y1KM-if00-port0`. It works in any USB port. If you swap in a different adapter, find its path with `ls /dev/serial/by-id/` and update `DEFAULT_BMS_PORT` or pass `--bms-port`.
-4. **Verify the register map before trusting the data.** EG4 doesn't publish the map in `BMS/bms_normalizer.py`; it comes from community drivers.
+4. **Register map.** EG4 doesn't publish one. The map in `BMS/bms_normalizer.py` was built from a `bms_probe` dump of the team's battery, checked against its display:
+   - **Confirmed:** SOC (reg 21), pack voltage (reg 22), remaining and full Ah (regs 26/27), cell count (reg 41), cells 1–16 (regs 113–128).
+   - **Probable:** current (reg 23) read 0 A in the dump. Confirm it by running the probe while current is flowing and checking the sign.
+   - **Not identified yet:** temperatures and the alarm flags are **not sent**. Unidentified registers are logged raw to `bms_data.csv` as `reg_NN` columns, so they can be matched against the display later.
+
+   To run the probe (from the repo folder, with the sender stopped):
    ```bash
    python3 -m BMS.bms_probe --scan         # which address answers?
    python3 -m BMS.bms_probe --address 1    # raw dump + decoded values
@@ -160,7 +165,7 @@ python3 telemetry_receiver.py --port COM4                        # Windows (defa
 ```
 Each packet is printed, for example:
 ```
-[rx:bms] SOC=87% event=DELTA_UPDATE device=20 seq=7 ...
+[rx:bms] event=DELTA_UPDATE device=20 seq=7 ... fields={'battery_voltage_v': 53.0, 'remaining_ah': 85.0, ...}
 ```
 If packets are lost, the receiver prints a `seq gap` line with the running loss percentage for the session.
 
@@ -181,7 +186,7 @@ LoRa airtime is limited, so readings are **not** all sent. Each device keeps a c
 | Device | Sends when... | Heartbeat |
 |---|---|---|
 | BMV | voltage ±50 mV, current ±200 mA, power ±10 W, SOC changes by a whole percent, or a new alarm | 3 s |
-| BMS | **SOC ±1 %**, voltage ±0.2 V, current ±1 A, highest/lowest cell ±10 mV, or any warning/protection/error flag change | 10 s |
+| BMS | **SOC ±1 %**, voltage ±0.2 V, current ±1 A, highest/lowest cell ±10 mV | 10 s |
 | MPPT | PV voltage ±2 V, PV current ±0.5 A, PV power ±1 W, battery voltage ±1 V; status frames at most every 5 s per board | 5 s |
 
 All thresholds can be changed with command-line flags (`python3 telemetry_sender.py --help`).
@@ -212,7 +217,7 @@ Fields carried over the radio:
 | Device | Fields |
 |---|---|
 | BMV | voltage_mv, current_ma, power_w, charge_state (SOC %), alarm, elapsed_s, peak_current_ma |
-| BMS | battery_voltage_v, battery_current_a, soc_pct, soh_pct, cell_v_max_mv, cell_v_min_mv, cell_max_idx, cell_min_idx, cell_sum_v, temp_max_c, temp_avg_c, remaining_ah, warning_flags, protection_flags, error_code, elapsed_s |
+| BMS | battery_voltage_v, battery_current_a, soc_pct, soh_pct, cell_v_max_mv, cell_v_min_mv, cell_max_idx, cell_min_idx, cell_sum_v, remaining_ah, elapsed_s (the layout also has slots for temp_max_c, temp_avg_c and the warning/protection/error flags, which are sent once their registers are identified) |
 | MPPT | pv_voltage_v, pv_current_a, pv_power_w, battery_voltage_v, battery_current_a, mode, fault, enabled, ambient_temp_c, heatsink_temp_c, mppt_index, packet_id |
 
 If you add or change a field, update its layout in `telemetry_packet.py` and bump `PROTOCOL_VERSION`. Then deploy to both ends.

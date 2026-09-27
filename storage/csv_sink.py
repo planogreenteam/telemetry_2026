@@ -25,11 +25,11 @@ CSV_COLUMNS = {
         "soc_pct", "soh_pct", "battery_voltage_v", "battery_current_a",
         "cell_sum_v", "cell_v_max_mv", "cell_v_min_mv", "cell_v_delta_mv",
         "cell_max_idx", "cell_min_idx", "cell_count",
-        "temp_max_c", "temp_avg_c", "temp_pcb_c",
-        "remaining_ah", "full_capacity_ah", "max_charge_a", "cycle_count",
-        "status", "warning_flags", "protection_flags", "error_code",
+        "remaining_ah", "full_capacity_ah", "cycle_count",
         "elapsed_s",
         *(f"cell_{i:02d}_mv" for i in range(1, 17)),
+        # Raw registers not identified yet (see BMS/bms_normalizer.py).
+        *(f"reg_{addr}" for addr in (19, 24, 25, 28, 33, 35, 39, 40)),
     ),
 }
 

@@ -26,10 +26,14 @@ import time
 
 import serial
 
-from BMS.bms_normalizer import REGISTER_BLOCK_COUNT, REGISTER_BLOCK_START
+from BMS.bms_normalizer import REGISTER_BLOCKS
 
 
 FUNC_READ_HOLDING = 0x03
+
+# Largest request sent in one go. The battery has answered 32-register
+# reads (bms_probe); bigger ones are split.
+MAX_REGS_PER_REQUEST = 32
 
 # How often (seconds) to print a diagnostic summary, same cadence as the
 # BMV reader so both show up together in the log.
@@ -113,10 +117,21 @@ class EG4ModbusReader:
             rest = self.serial.read(head[2] + 2)  # data + CRC
         return parse_read_response(head + rest, self.address, count)
 
+    def read_blocks(self, blocks):
+        """Read every (start, count) range, split into requests of at most
+        MAX_REGS_PER_REQUEST. Returns {register_address: u16}."""
+        registers = {}
+        for start, count in blocks:
+            for chunk_start in range(start, start + count, MAX_REGS_PER_REQUEST):
+                n = min(MAX_REGS_PER_REQUEST, start + count - chunk_start)
+                values = self.read_registers(chunk_start, n)
+                registers.update(zip(range(chunk_start, chunk_start + n), values))
+        return registers
+
     def read_frame(self):
-        """Poll the live-data block once per poll_interval. Returns
-        {"registers": [...], "rx_timestamp": float} or None if this poll
-        failed (the caller just tries again next time)."""
+        """Poll the live-data registers once per poll_interval. Returns
+        {"registers": {address: value}, "rx_timestamp": float} or None if
+        this poll failed (the caller just tries again next time)."""
         delay = self._next_poll - time.monotonic()
         if delay > 0:
             time.sleep(delay)
@@ -125,12 +140,12 @@ class EG4ModbusReader:
 
         frame = None
         try:
-            registers = self.read_registers(REGISTER_BLOCK_START, REGISTER_BLOCK_COUNT)
+            registers = self.read_blocks(REGISTER_BLOCKS)
             frame = {"registers": registers, "rx_timestamp": time.time()}
             self._ok += 1
             if not self._first_ok_logged:
                 print(f"[bms-reader] First Modbus reply from address "
-                      f"{self.address}: {registers}", flush=True)
+                      f"{self.address}: {len(registers)} registers", flush=True)
                 self._first_ok_logged = True
         except ModbusError as exc:
             self._failed += 1
