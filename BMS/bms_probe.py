@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from BMS.bms_normalizer import (  # noqa: E402
-    REG, REGISTER_BLOCK_COUNT, REGISTER_BLOCK_START, normalize_bms_frame,
+    NUM_CELLS, REG, REGISTER_BLOCKS, UNIDENTIFIED_REGS, normalize_bms_frame,
 )
 from BMS.bms_reader import EG4ModbusReader, ModbusError  # noqa: E402
 from telemetry_sender import DEFAULT_BMS_PORT  # noqa: E402
@@ -36,8 +36,10 @@ from telemetry_sender import DEFAULT_BMS_PORT  # noqa: E402
 DUMP_CHUNK = 32
 
 _LABELS = {addr: name for name, addr in REG.items()}
-for _i in range(16):
+for _i in range(NUM_CELLS):
     _LABELS[REG["cell_first"] + _i] = f"cell {_i + 1}"
+for _addr in UNIDENTIFIED_REGS:
+    _LABELS[_addr] = "? (not identified yet)"
 
 
 def scan(reader, first, last):
@@ -78,7 +80,7 @@ def dump(reader, count):
 
 
 def decoded(reader):
-    regs = reader.read_registers(REGISTER_BLOCK_START, REGISTER_BLOCK_COUNT)
+    regs = reader.read_blocks(REGISTER_BLOCKS)
     reading = normalize_bms_frame({"registers": regs}, device_id=0)
     print("\nDecoded with the current register map:")
     for key, value in reading["fields"].items():
@@ -93,7 +95,8 @@ def main(argv=None):
     parser.add_argument("--baud", type=int, default=9600)
     parser.add_argument("--address", type=int, default=1, help="Battery DIP address")
     parser.add_argument("--scan", action="store_true", help="Try addresses 1..16 and stop")
-    parser.add_argument("--count", type=int, default=128, help="Registers to dump")
+    # 136 so the dump includes cell 16 (register 128).
+    parser.add_argument("--count", type=int, default=136, help="Registers to dump")
     args = parser.parse_args(argv)
 
     reader = EG4ModbusReader(args.port, baud=args.baud, address=args.address)
