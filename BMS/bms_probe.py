@@ -29,7 +29,9 @@ if str(ROOT) not in sys.path:
 from BMS.bms_normalizer import (  # noqa: E402
     NUM_CELLS, REG, REGISTER_BLOCKS, UNIDENTIFIED_REGS, normalize_bms_frame,
 )
-from BMS.bms_reader import EG4ModbusReader, ModbusError  # noqa: E402
+from BMS.bms_reader import (  # noqa: E402
+    FUNC_READ_HOLDING, FUNC_READ_INPUT, EG4ModbusReader, ModbusError,
+)
 from telemetry_sender import DEFAULT_BMS_PORT  # noqa: E402
 
 # Read the wider dump in chunks: some BMS firmware rejects big requests.
@@ -58,25 +60,41 @@ def scan(reader, first, last):
     return found
 
 
-def dump(reader, count):
-    print(f"\nRaw registers 0..{count - 1} from address {reader.address}:")
+def _read_chunk(reader, start, n, func):
+    """Read a chunk; if the whole chunk is refused (e.g. it runs past the
+    end of the battery's table), fall back to one register at a time and
+    stop at the first one that fails. Returns (values, error)."""
+    try:
+        return reader.read_registers(start, n, func), None
+    except ModbusError as exc:
+        values = []
+        for reg in range(start, start + n):
+            try:
+                values.extend(reader.read_registers(reg, 1, func))
+            except ModbusError:
+                break
+        return values, exc
+
+
+def dump(reader, count, func=FUNC_READ_HOLDING):
+    table = "input" if func == FUNC_READ_INPUT else "holding"
+    labels = _LABELS if func == FUNC_READ_HOLDING else {}
+    print(f"\nRaw {table} registers 0..{count - 1} from address {reader.address}:")
     print(f"{'reg':>4}  {'hex':>6}  {'u16':>6}  {'s16':>6}  label")
     for start in range(0, count, DUMP_CHUNK):
         n = min(DUMP_CHUNK, count - start)
-        try:
-            regs = reader.read_registers(start, n)
-        except ModbusError as exc:
-            print(f"  regs {start}..{start + n - 1}: {exc}")
-            continue
+        regs, error = _read_chunk(reader, start, n, func)
         for offset, value in enumerate(regs):
             reg = start + offset
             s16 = value - 0x10000 if value & 0x8000 else value
             ascii_pair = bytes([value >> 8, value & 0xFF])
             text = ascii_pair.decode("ascii") if all(32 <= b < 127 for b in ascii_pair) else ""
-            label = _LABELS.get(reg, "")
+            label = labels.get(reg, "")
             if text:
                 label = f"{label}  '{text}'".strip()
             print(f"{reg:>4}  0x{value:04X}  {value:>6}  {s16:>6}  {label}")
+        if error is not None and len(regs) < n:
+            print(f"  regs {start + len(regs)}..{start + n - 1}: {error}")
 
 
 def decoded(reader):
@@ -95,14 +113,20 @@ def main(argv=None):
     parser.add_argument("--baud", type=int, default=9600)
     parser.add_argument("--address", type=int, default=1, help="Battery DIP address")
     parser.add_argument("--scan", action="store_true", help="Try addresses 1..16 and stop")
-    # 136 so the dump includes cell 16 (register 128).
-    parser.add_argument("--count", type=int, default=136, help="Registers to dump")
+    # 129 = registers 0..128: the battery answers nothing above 128.
+    parser.add_argument("--count", type=int, default=129, help="Registers to dump")
+    parser.add_argument("--input-registers", action="store_true",
+                        help="Dump the input-register table (Modbus 0x04) "
+                             "instead of the holding registers")
     args = parser.parse_args(argv)
 
     reader = EG4ModbusReader(args.port, baud=args.baud, address=args.address)
     try:
         if args.scan:
             scan(reader, 1, 16)
+            return
+        if args.input_registers:
+            dump(reader, args.count, FUNC_READ_INPUT)
             return
         dump(reader, args.count)
         try:

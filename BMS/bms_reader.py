@@ -30,6 +30,10 @@ from BMS.bms_normalizer import REGISTER_BLOCKS
 
 
 FUNC_READ_HOLDING = 0x03
+# "Input registers" are a second, separate register table some devices use
+# for measurements. Only bms_probe uses it (--input-registers), to look for
+# data the holding registers don't expose.
+FUNC_READ_INPUT = 0x04
 
 # Largest request sent in one go. The battery has answered 32-register
 # reads (bms_probe); bigger ones are split.
@@ -61,13 +65,15 @@ def _with_crc(body: bytes) -> bytes:
     return body + struct.pack("<H", crc16_modbus(body))
 
 
-def build_read_request(address: int, start: int, count: int) -> bytes:
-    return _with_crc(struct.pack(">BBHH", address, FUNC_READ_HOLDING, start, count))
+def build_read_request(address: int, start: int, count: int,
+                       func: int = FUNC_READ_HOLDING) -> bytes:
+    return _with_crc(struct.pack(">BBHH", address, func, start, count))
 
 
-def parse_read_response(frame: bytes, address: int, count: int) -> list:
-    """Validate a complete 0x03 response frame and return its registers as
-    unsigned 16-bit ints. Raises ModbusError on anything wrong."""
+def parse_read_response(frame: bytes, address: int, count: int,
+                        func: int = FUNC_READ_HOLDING) -> list:
+    """Validate a complete read-registers response frame and return its
+    registers as unsigned 16-bit ints. Raises ModbusError on anything wrong."""
     if len(frame) < 5:
         raise ModbusError(f"response too short ({len(frame)} bytes)")
     body, crc_rx = frame[:-2], struct.unpack("<H", frame[-2:])[0]
@@ -75,9 +81,9 @@ def parse_read_response(frame: bytes, address: int, count: int) -> list:
         raise ModbusError("CRC mismatch")
     if body[0] != address:
         raise ModbusError(f"reply from address {body[0]}, expected {address}")
-    if body[1] == FUNC_READ_HOLDING | 0x80:
+    if body[1] == func | 0x80:
         raise ModbusError(f"exception reply, code {body[2]}")
-    if body[1] != FUNC_READ_HOLDING:
+    if body[1] != func:
         raise ModbusError(f"unexpected function 0x{body[1]:02X}")
     if body[2] != count * 2 or len(body) != 3 + count * 2:
         raise ModbusError(f"byte count {body[2]}, expected {count * 2}")
@@ -99,9 +105,10 @@ class EG4ModbusReader:
         self._last_report = time.monotonic()
         self._first_ok_logged = False
 
-    def read_registers(self, start, count):
-        """One Modbus 0x03 transaction. Returns a list of u16 registers."""
-        request = build_read_request(self.address, start, count)
+    def read_registers(self, start, count, func=FUNC_READ_HOLDING):
+        """One Modbus read transaction (0x03 holding registers by default).
+        Returns a list of u16 registers."""
+        request = build_read_request(self.address, start, count, func)
         # Drop any stale bytes (a late reply to a previous request, line
         # noise) so they can't be mistaken for the start of this reply.
         self.serial.reset_input_buffer()
@@ -115,7 +122,7 @@ class EG4ModbusReader:
             rest = self.serial.read(2)          # exception code already in head[2]
         else:
             rest = self.serial.read(head[2] + 2)  # data + CRC
-        return parse_read_response(head + rest, self.address, count)
+        return parse_read_response(head + rest, self.address, count, func)
 
     def read_blocks(self, blocks):
         """Read every (start, count) range, split into requests of at most

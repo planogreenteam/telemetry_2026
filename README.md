@@ -101,7 +101,8 @@ Plug in the Victron VE.Direct USB cable. The default port in `telemetry_sender.p
 4. **Register map.** EG4 doesn't publish one. The map in `BMS/bms_normalizer.py` was built from a `bms_probe` dump of the team's battery, checked against its display:
    - **Confirmed:** SOC (reg 21), pack voltage (reg 22), remaining and full Ah (regs 26/27), cell count (reg 41), cells 1–16 (regs 113–128).
    - **Probable:** current (reg 23) read 0 A in the dump. Confirm it by running the probe while current is flowing and checking the sign.
-   - **Not identified yet:** temperatures and the alarm flags are **not sent**. Unidentified registers are logged raw to `bms_data.csv` as `reg_NN` columns, so they can be matched against the display later.
+   - **Temperature:** register 24 is the hottest cell sensor, sent as `temp_max_c`. The battery answers only registers 0–128, and the individual cell sensors and the PCB temperature aren't among them. To look for them in the second ("input") register table, run `python3 -m BMS.bms_probe --input-registers`.
+   - **Not identified yet:** the alarm flags are **not sent**. Unidentified registers are logged raw to `bms_data.csv` as `reg_NN` columns, so they can be matched against the display later.
 
    To run the probe (from the repo folder, with the sender stopped):
    ```bash
@@ -217,7 +218,7 @@ Fields carried over the radio:
 | Device | Fields |
 |---|---|
 | BMV | voltage_mv, current_ma, power_w, charge_state (SOC %), alarm, elapsed_s, peak_current_ma |
-| BMS | battery_voltage_v, battery_current_a, soc_pct, soh_pct, cell_v_max_mv, cell_v_min_mv, cell_max_idx, cell_min_idx, cell_sum_v, remaining_ah, elapsed_s (the layout also has slots for temp_max_c, temp_avg_c and the warning/protection/error flags, which are sent once their registers are identified) |
+| BMS | battery_voltage_v, battery_current_a, soc_pct, soh_pct, cell_v_max_mv, cell_v_min_mv, cell_max_idx, cell_min_idx, cell_sum_v, temp_max_c, remaining_ah, elapsed_s (the layout also has slots for temp_avg_c and the warning/protection/error flags, which are sent once their registers are identified) |
 | MPPT | pv_voltage_v, pv_current_a, pv_power_w, battery_voltage_v, battery_current_a, mode, fault, enabled, ambient_temp_c, heatsink_temp_c, mppt_index, packet_id |
 
 If you add or change a field, update its layout in `telemetry_packet.py` and bump `PROTOCOL_VERSION`. Then deploy to both ends.

@@ -13,6 +13,9 @@ Verified against the battery's own display (53.16 V, 0.0 A, 85 %):
     reg 37 / 38   highest / lowest cell, mV    3323 / 3322
     reg 41        number of cells              16
     reg 113..128  cells 1..16, mV              3322/3323 — they sum to 53.16 V
+    reg 24        hottest cell sensor, °C      36 then 37 in two dumps; the
+                                               display's four cell sensors
+                                               read 37/36/36/37 (PCB 40)
 
 Probable, not yet proven (were 0 or unambiguous-looking in one dump):
 
@@ -22,12 +25,22 @@ Probable, not yet proven (were 0 or unambiguous-looking in one dump):
     reg 30        cycle count                  7
     reg 32        state of health, %           100
 
+Register 24 could in principle be the average rather than the maximum —
+the four sensors are within 1 °C of each other, so it makes no practical
+difference; a hot spot after a drive would tell them apart.
+
+The battery answers holding registers 0..128 only (reads starting at 128
+or above time out). The individual cell-temperature sensors and the PCB
+temperature shown on the display are NOT in that table; they may be in
+the input-register table (bms_probe --input-registers).
+
 Not identified yet (logged raw to bms_data.csv as reg_NN so they can be
-matched later): 19 (97), 24 (36), 25 (5000), 28 (530), 33 (5600),
-35 (10000), 39 (8), 40 (8). Temperatures and the warning / protection /
-error flags are somewhere in here or in registers that read 0 with no
-alarm active, so they are NOT sent until identified — a wrong register
-there is worse than no value.
+matched later): 19 (97, constant), 25 (5000), 28 (530), 33 (5600),
+35 (10000), 39 / 40 (small numbers that change: probably the highest /
+lowest cell numbers). The warning / protection / error flags are
+probably among the registers that read 0 while no alarm is active, so
+they are NOT sent until identified — a wrong register there is worse than
+no value.
 
 To re-check: python3 -m BMS.bms_probe --address <DIP address>
 ────────────────────────────────────────────────────────────────────
@@ -45,6 +58,7 @@ REG = {
     "full_ah":        27,   # 0.01 Ah
     "cycle_count":    30,   # probable
     "soh":            32,   # %, probable
+    "temp_max":       24,   # °C, signed; hottest cell sensor
     "cell_count":     41,
     "cell_first":     113,  # cells 1..16 in regs 113..128, mV
 }
@@ -52,7 +66,7 @@ REG = {
 NUM_CELLS = 16
 
 # Registers read but not yet identified; logged raw for later mapping.
-UNIDENTIFIED_REGS = (19, 24, 25, 28, 33, 35, 39, 40)
+UNIDENTIFIED_REGS = (19, 25, 28, 33, 35, 39, 40)
 
 # (start, count) ranges fetched every poll by BMS/bms_reader.py. The reader
 # splits them into requests of at most 32 registers (sizes the probe has
@@ -108,6 +122,7 @@ def normalize_bms_frame(raw_frame, device_id):
         "remaining_ah":      regs[REG["remaining_ah"]] / 100.0,
         "full_capacity_ah":  regs[REG["full_ah"]] / 100.0,
         "cycle_count":       regs[REG["cycle_count"]],
+        "temp_max_c":        _s16(regs[REG["temp_max"]]),
         "cell_count":        regs[REG["cell_count"]],
     }
 
