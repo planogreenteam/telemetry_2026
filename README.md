@@ -2,7 +2,7 @@
 
 Live telemetry from the solar car to the ground station.
 
-A Raspberry Pi on the car reads three devices and sends compact binary packets over a LoRa radio. A laptop at the ground station receives them and writes them to CSV and InfluxDB, where Grafana displays them.
+A Raspberry Pi on the car reads four devices and sends compact binary packets over a LoRa radio. A laptop at the ground station receives them and writes them to CSV and InfluxDB, where Grafana displays them.
 
 ```mermaid
 flowchart LR
@@ -10,6 +10,7 @@ flowchart LR
         BMV["Victron BMV-712 shunt<br/>VE.Direct USB"] --> S
         BMS["EG4 LL-S battery BMS<br/>RS485 / Modbus RTU via USB"] --> S
         MPPT["6x TPEE SEC-B175 MPPTs<br/>CAN bus (can0)"] --> S
+        RTD["Motor PT100 probe + MAX31865<br/>SPI (spidev0.1)"] --> S
         S["normalize, decide what to send,<br/>build packets"] --> CSV1[("on-car CSVs")]
         S --> TX["LoRa modem (LA66)"]
     end
@@ -26,6 +27,7 @@ flowchart LR
 | `bmv` | Victron BMV-712 battery shunt | VE.Direct USB cable | `BMV/` | 1 |
 | `bms` | EG4 LL-S battery BMS | Battery RJ45 RS485 port → USB-RS485 adapter (Modbus RTU, 9600 8N1) | `BMS/` | 20 |
 | `can` | 6× TPEE SEC-B175 MPPTs | CAN bus through an MCP2515 CAN hat (SocketCAN `can0`) | `CAN/` | 1–6 (one per board) |
+| `rtd` | Motor temperature: PT100 3-wire probe (Adafruit #3290) on a MAX31865 board (Adafruit #3328) | SPI0, chip select CE1 (`/dev/spidev0.1`) | `RTD/` | 30 |
 
 > **Update the car and the ground station together.** Both ends use the packet format in `telemetry_packet.py`. The receiver rejects packets whose protocol version doesn't match its own (currently **v3**).
 
@@ -53,6 +55,10 @@ CAN/   can_reader.py      SocketCAN reader with kernel-level ID filtering
        can_normalizer.py  TPEE Open-SEC frame decoding + list of MPPT IDs
        can_handler.py     Receiver console formatter
 
+RTD/   max31865_reader.py MAX31865 SPI driver (spidev only) for the motor PT100: one-shot conversions + fault status
+       rtd_normalizer.py  Raw code -> ohms -> degrees C (Callendar-Van Dusen), fault names
+       rtd_handler.py     Receiver console formatter
+
 LORA/  lora_transport.py  AT-command driver for the LA66 LoRa modem
        radio_config.py    Radio settings shared by every sender and receiver
        sender.py          Test tool: send one text/hex message
@@ -73,7 +79,7 @@ On both the Pi and the ground-station machine:
 ```bash
 python3 -m pip install -r requirements.txt
 ```
-The requirements are `pyserial`, `python-can`, `influxdb-client` and `pyinstaller`.
+The requirements are `pyserial`, `python-can`, `influxdb-client`, `pyinstaller` and, on Linux only, `spidev` (for the MAX31865).
 
 Your user needs access to the USB serial ports (Linux):
 ```bash
@@ -133,6 +139,36 @@ Plug in the Victron VE.Direct USB cable. The default port in `telemetry_sender.p
    - The order of the list sets each board's `mppt_index` (0, 1, 2, ...) and its device_id (1 + index).
    - Frames from IDs not in the list are dropped by the kernel filter.
 
+### Motor temperature probe (PT100 + MAX31865, SPI)
+The motor temperature probe is an Adafruit #3290 PT100, which is **3-wire**, read by an Adafruit #3328 MAX31865 board (430 Ω reference resistor) on the Pi's SPI bus.
+
+1. **Configure the board for 3-wire.** It ships set up for 2- or 4-wire. Follow Adafruit's guide ("RTD Wiring & Config"):
+   - Solder closed the jumper labelled **2/3 Wire**.
+   - Cut the trace connecting the left side of the 2-way jumper right above Rref, then solder closed its right side, labelled **3**.
+2. **Connect the probe.** The two wires of the same colour go in the right-hand terminal blocks, **F+** and **RTD+**; it doesn't matter which is which. The third wire goes to **RTD−/F−** on the left.
+3. **Connect the board to the Pi.** The CAN hat already uses SPI chip select CE0, so the MAX31865 uses **CE1**:
+
+   | MAX31865 | Pi pin | Pi signal |
+   |---|---|---|
+   | Vin | 1 (or 17) | 3.3 V |
+   | GND | 6 (or any GND) | GND |
+   | CLK | 23 | GPIO11 / SCLK |
+   | SDO | 21 | GPIO9 / MISO |
+   | SDI | 19 | GPIO10 / MOSI |
+   | CS | 26 | GPIO7 / CE1 |
+
+   These pins are shared with the CAN hat (CS excepted), so you need a hat with a pass-through header or a stacking header. If your CAN hat is a dual-channel model that also uses CE1, wire CS to a free chip select instead and pass `--rtd-spi-device`.
+
+   **Mount the MAX31865 board next to the Pi, not at the motor.** Keep the six SPI wires short (under about 30 cm). SPI isn't designed to run any distance, and the motor controller's switching noise corrupts long SPI lines. Bridge the distance with the probe's leads instead: if the 1 m lead doesn't reach, extend all three wires with the **same gauge and the same length**. 3-wire compensation assumes equal lead resistance. Twist the three wires together, use shielded cable with the shield grounded at the board end only, and route it away from the motor phase cables.
+4. **SPI** is already enabled by `dtparam=spi=on` (see the MPPT section). `ls /dev/spidev*` should list `/dev/spidev0.1`. The mcp2515 overlay takes over CE0, so `spidev0.0` won't be listed; that's expected.
+5. **Check it:**
+   ```bash
+   python3 telemetry_sender.py --device rtd --dry-run
+   ```
+   At startup the sender writes a test pattern to the MAX31865 and reads it back. If the board doesn't answer, it reports `No MAX31865 answering on /dev/spidev0.1` and (with `--device all`) skips the RTD. At room temperature, expect about 108–110 Ω and 20–25 °C.
+
+Options: `--rtd-wires 2|3|4` must match the jumpers, `--rtd-filter-hz 50|60` (default 60) and `--rtd-poll-seconds` (default 1). The resistor values `R_REF` (430 Ω) and `R_NOMINAL` (100 Ω) are at the top of `RTD/rtd_normalizer.py`. Change them if you switch to the PT1000 version of the board (`R_REF = 4300`, `R_NOMINAL = 1000`).
+
 ---
 
 ## Running
@@ -146,12 +182,13 @@ By default (`--device all`) it opens every device it can find and skips any whos
 python3 telemetry_sender.py --device bmv
 python3 telemetry_sender.py --device bms --bms-address 1
 python3 telemetry_sender.py --device can
+python3 telemetry_sender.py --device rtd
 ```
 To read the hardware and print the packets instead of transmitting (no radio needed):
 ```bash
 python3 telemetry_sender.py --device bms --dry-run
 ```
-The sender writes these CSVs in its working directory: `bmv_data.csv`, `bms_data.csv` (includes all 16 cell voltages) and `mppt_data.csv`. If an existing CSV has an older column layout, it's renamed to `*.old-<time>.csv` rather than appended to.
+The sender writes these CSVs in its working directory: `bmv_data.csv`, `bms_data.csv` (includes all 16 cell voltages), `mppt_data.csv` and `rtd_data.csv` (motor temperature, resistance, raw code and fault for every conversion). If an existing CSV has an older column layout, it's renamed to `*.old-<time>.csv` rather than appended to.
 
 Every 5 s the sender prints a health line for each device, for example:
 ```
@@ -189,11 +226,12 @@ LoRa airtime is limited, so readings are **not** all sent. Each device keeps a c
 | BMV | voltage ±50 mV, current ±200 mA, power ±10 W, SOC changes by a whole percent, or a new alarm | 3 s |
 | BMS | **SOC ±1 %**, voltage ±0.2 V, current ±1 A, highest/lowest cell ±10 mV | 10 s |
 | MPPT | PV voltage ±2 V, PV current ±0.5 A, PV power ±1 W, battery voltage ±1 V; status frames at most every 5 s per board | 5 s |
+| RTD | motor temperature ±0.5 °C, or a sensor fault appears or clears | 10 s |
 
 All thresholds can be changed with command-line flags (`python3 telemetry_sender.py --help`).
 
 Other behaviour:
-- **Priority on the shared modem:** BMV, then BMS, then MPPTs. A waiting BMV packet always goes out next, ahead of queued MPPT packets.
+- **Priority on the shared modem:** BMV, then BMS, then RTD, then MPPTs. A waiting BMV packet always goes out next, ahead of queued MPPT packets.
 - **MPPT batching:** up to 4 MPPT packets ride in one radio frame, which costs one modem command instead of four.
 - **Peak current is never lost:** the BMV packet carries `peak_current_ma`, the deepest discharge seen since the last BMV packet that got through.
 - **Drive timer (`elapsed_s`):** starts the first time the BMV or BMS sees more than 0.5 A of discharge (`--drive-start-current-a`) and counts until the sender stops. It is sent on BMV and BMS packets.
@@ -205,7 +243,7 @@ Other behaviour:
 
 ```
 header (14 bytes, big-endian)
-  u8 version (=3) | u8 msg_type (1=BMV 2=MPPT 3=BMS) | u8 event_type | u8 device_id
+  u8 version (=3) | u8 msg_type (1=BMV 2=MPPT 3=BMS 4=RTD) | u8 event_type | u8 device_id
   u16 seq | u32 timestamp (unix s) | u16 field_mask
 payload   only the fields whose bit is set in field_mask, packed per the device's layout
 crc16     2 bytes over header + payload
@@ -220,8 +258,13 @@ Fields carried over the radio:
 | BMV | voltage_mv, current_ma, power_w, charge_state (SOC %), alarm, elapsed_s, peak_current_ma |
 | BMS | battery_voltage_v, battery_current_a, soc_pct, soh_pct, cell_v_max_mv, cell_v_min_mv, cell_max_idx, cell_min_idx, cell_sum_v, temp_max_c, remaining_ah, elapsed_s (the layout also has slots for temp_avg_c and the warning/protection/error flags, which are sent once their registers are identified) |
 | MPPT | pv_voltage_v, pv_current_a, pv_power_w, battery_voltage_v, battery_current_a, mode, fault, enabled, ambient_temp_c, heatsink_temp_c, mppt_index, packet_id |
+| RTD | motor_temp_c, resistance_ohm, fault (a reading with a fault carries only `fault`, so a broken probe never shows up as a believable temperature) |
 
 If you add or change a field, update its layout in `telemetry_packet.py` and bump `PROTOCOL_VERSION`. Then deploy to both ends.
+
+Adding a new **msg_type** (as with RTD) doesn't need a bump: existing layouts are unchanged. A receiver that predates it keeps decoding BMV, MPPT and BMS, and logs the new packets as undecodable until it's updated.
+
+The RTD `fault` byte is the MAX31865 fault status register: 0x80 RTD high (open probe), 0x40 RTD low (shorted probe), 0x20/0x10/0x08 REFIN/RTDIN out of range (usually an open wire), 0x04 over/under-voltage. The software adds 0x01 (`no_signal`) when the chip returns a zero code with no fault.
 
 ---
 
@@ -239,6 +282,7 @@ The receiver writes every packet to InfluxDB (v2) under the measurement `telemet
 | BMV bucket | `--influx-bucket-bmv` | `INFLUX_BUCKET_BMV` | `BMV-data` |
 | MPPT bucket | `--influx-bucket-can` | `INFLUX_BUCKET_CAN` | `CAN-data` |
 | BMS bucket | `--influx-bucket-bms` | `INFLUX_BUCKET_BMS` | `BMS-data` |
+| RTD bucket | `--influx-bucket-rtd` | `INFLUX_BUCKET_RTD` | `RTD-data` |
 | Other types | `--influx-bucket` | `INFLUX_BUCKET` | `Default-data` |
 
 **Token:** put it in a `.env` file in the directory you run the receiver from. The file is git-ignored.
@@ -249,7 +293,9 @@ An older commit had a token hard-coded in `telemetry_receiver.py`, so it is stil
 
 InfluxDB writes run on a background thread. If InfluxDB is slow or down, the receiver keeps receiving and `received_events.csv` still records everything.
 
-Import `GrafanaScript.JSON` into Grafana for the team dashboard. The dashboard doesn't have BMS panels yet; add them from the `BMS` `msg_type` (for example `fields_soc_pct`).
+**Create the `RTD-data` bucket in InfluxDB** (or point `--influx-bucket-rtd` at an existing one) before running the receiver. Otherwise the RTD writes fail, though CSV still records them.
+
+Import `GrafanaScript.JSON` into Grafana for the team dashboard. The dashboard doesn't have BMS or RTD panels yet; add them from the `BMS` `msg_type` (for example `fields_soc_pct`) and the `RTD` `msg_type` (`fields_motor_temp_c`).
 
 ---
 
@@ -274,6 +320,9 @@ python3 LORA/sender.py --port /dev/serial/by-id/<lora-modem> --text hello
 | `[bmv-reader] Non-tab-delimited line` | Wrong port or baud rate for the BMV. |
 | `[all] CAN unavailable, skipping` | `can0` isn't up; run the `ip link` command above. |
 | An MPPT never appears | Its ID isn't in `MPPT_EFFECTIVE_IDS`; check `candump can0`. |
+| `No MAX31865 answering on /dev/spidev0.1` | SPI not enabled, CS not on pin 26 (CE1), SDI/SDO swapped, or no 3.3 V. `ls /dev/spidev*` should list `spidev0.1`. |
+| RTD sends only `fault` (`rtd_high`, `refin_low`, ...) | Probe unplugged or a loose terminal, or the jumpers don't match `--rtd-wires`. |
+| RTD temperature is off by several °C | The board is jumpered for 2/4-wire with a 3-wire probe (or the reverse), or `R_REF` doesn't match the board. |
 | Receiver prints `Unsupported protocol version` | One end wasn't updated; deploy the same code to both. |
 | Many `seq gap` lines | Radio range or antenna problems, or mismatched radio settings. |
 | `No InfluxDB token provided` | Create `.env` with `INFLUX_TOKEN=...`. |

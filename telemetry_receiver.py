@@ -24,6 +24,7 @@ from BMV.bmv_handler import format_bmv_packet
 from CAN.can_handler import format_mppt_packet
 from LORA import radio_config as radio
 from LORA.lora_transport import LoRaTransport, extract_hex_payload
+from RTD.rtd_handler import format_rtd_packet
 from storage.event_csv_sink import write_event_csv
 from telemetry_packet import MsgType, decode_packet, is_batch, split_batch
 
@@ -552,6 +553,7 @@ DEFAULT_INFLUX_BUCKET_BMV = os.getenv("INFLUX_BUCKET_BMV", "BMV-data")
 DEFAULT_INFLUX_BUCKET_CAN = os.getenv("INFLUX_BUCKET_CAN", "CAN-data")
 # RS485 BMS data (EG4 LL-S) gets its own bucket.
 DEFAULT_INFLUX_BUCKET_BMS = os.getenv("INFLUX_BUCKET_BMS", "BMS-data")
+DEFAULT_INFLUX_BUCKET_RTD = os.getenv("INFLUX_BUCKET_RTD", "RTD-data")
 DEFAULT_INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "telemetry")
 
 
@@ -584,6 +586,7 @@ def build_handlers(_args):
         MsgType.BMV:  format_bmv_packet,
         MsgType.MPPT: format_mppt_packet,
         MsgType.BMS:  format_bms_packet,
+        MsgType.RTD:  format_rtd_packet,
     }
 
 
@@ -618,6 +621,7 @@ def build_influx_writer(args):
         MsgType.BMV:  args.influx_bucket_bmv,
         MsgType.MPPT: args.influx_bucket_can,
         MsgType.BMS:  args.influx_bucket_bms,
+        MsgType.RTD:  args.influx_bucket_rtd,
     }
 
     return InfluxWriter(
@@ -687,6 +691,8 @@ def build_parser():
                         help="InfluxDB bucket for MPPT packets (env: INFLUX_BUCKET_CAN)")
     parser.add_argument("--influx-bucket-bms", default=DEFAULT_INFLUX_BUCKET_BMS,
                         help="InfluxDB bucket for BMS packets (env: INFLUX_BUCKET_BMS)")
+    parser.add_argument("--influx-bucket-rtd", default=DEFAULT_INFLUX_BUCKET_RTD,
+                        help="InfluxDB bucket for RTD temperature packets (env: INFLUX_BUCKET_RTD)")
     parser.add_argument("--influx-measurement", default=DEFAULT_INFLUX_MEASUREMENT,
                         help="InfluxDB measurement name (env: INFLUX_MEASUREMENT)")
     return parser

@@ -1,4 +1,5 @@
 pyserial
 python-can
 influxdb-client
+spidev; sys_platform == "linux"
 pyinstaller

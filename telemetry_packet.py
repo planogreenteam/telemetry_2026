@@ -3,7 +3,7 @@
 
 Header (14 bytes, big-endian):
     u8   protocol version
-    u8   msg_type (1=BMV, 2=MPPT, 3=BMS)
+    u8   msg_type (1=BMV, 2=MPPT, 3=BMS, 4=RTD)
     u8   event_type
     u8   device_id
     u16  seq
@@ -28,6 +28,10 @@ from typing import NamedTuple
 # single-snapshot layout, and wire scales became per-layout (a shared
 # by-name scale table gave BMS battery_current_a the MPPT x2000 scale,
 # clamping it at +/-16.4 A). Sender and receiver must be updated together.
+#
+# RTD (msg_type 4) was added without a version bump: it is a new msg_type,
+# not a change to an existing layout, so a receiver that predates it still
+# decodes BMV/MPPT/BMS and only logs the RTD packets as undecodable.
 PROTOCOL_VERSION = 3
 CRC_FORMAT = ">H"
 HEADER_FORMAT = ">BBBBHIH"
@@ -39,6 +43,7 @@ class MsgType(IntEnum):
     BMV  = 1
     MPPT = 2
     BMS  = 3
+    RTD  = 4
 
 
 class EventType(IntEnum):
@@ -178,10 +183,33 @@ BMS_FIELD_LAYOUT = (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RTD field layout — PT100 probe on the motor, read by a MAX31865 over SPI
+# (see RTD/)
+#
+# motor_temp_c is i16 x100 (0.01 C; +/-327 C is well past any motor limit);
+# resistance_ohm is u16 x100 (a PT100 is ~390 ohm at its 850 C limit). A
+# reading with a sensor fault carries only the fault byte.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RTDField(IntEnum):
+    MOTOR_TEMP_C   = 1 << 0
+    RESISTANCE_OHM = 1 << 1
+    FAULT          = 1 << 2
+
+
+RTD_FIELD_LAYOUT = (
+    WireField(RTDField.MOTOR_TEMP_C,   "motor_temp_c",   ">h", 100),
+    WireField(RTDField.RESISTANCE_OHM, "resistance_ohm", ">H", 100),
+    WireField(RTDField.FAULT,          "fault",          ">B"),
+)
+
+
 _LAYOUTS = {
     MsgType.BMV:  BMV_FIELD_LAYOUT,
     MsgType.MPPT: MPPT_FIELD_LAYOUT,
     MsgType.BMS:  BMS_FIELD_LAYOUT,
+    MsgType.RTD:  RTD_FIELD_LAYOUT,
 }
 
 
@@ -295,6 +323,12 @@ def build_mppt_packet(normalized, event_type, seq):
 def build_bms_packet(normalized, event_type, seq):
     return _build_typed_packet(
         normalized, event_type, seq, MsgType.BMS, BMS_FIELD_LAYOUT, "bms"
+    )
+
+
+def build_rtd_packet(normalized, event_type, seq):
+    return _build_typed_packet(
+        normalized, event_type, seq, MsgType.RTD, RTD_FIELD_LAYOUT, "rtd"
     )
 
 

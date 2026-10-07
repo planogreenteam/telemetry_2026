@@ -5,9 +5,10 @@ Sources (each optional; `--device all` runs whichever can be opened):
     bmv  Victron BMV-712 shunt        VE.Direct over USB
     bms  EG4 LL-S battery BMS         Modbus RTU over RS485 (RJ45 -> USB)
     can  TPEE SEC-B175 MPPTs          CAN bus (SocketCAN)
+    rtd  motor PT100 on a MAX31865    SPI (spidev, CE1)
 
 All sources share one LoRa modem through PriorityLockedTransport:
-BMV > BMS > CAN.
+BMV > BMS > RTD > CAN.
 """
 import argparse
 import heapq
@@ -36,6 +37,7 @@ from telemetry_packet import (
     build_bms_packet,
     build_bmv_packet,
     build_mppt_packet,
+    build_rtd_packet,
 )
 from transmit_policy import GenericTransmitPolicy
 
@@ -84,6 +86,17 @@ DEFAULT_MPPT_DEVICE_ID = 1
 DEFAULT_MPPT_HEARTBEAT_SECONDS = 5
 DEFAULT_CSV_PATH_MPPT = "mppt_data.csv"
 
+# RTD (motor-temperature PT100 on an Adafruit MAX31865 board). The MCP2515 CAN hat owns SPI0
+# CE0 (spidev0.0), so the MAX31865's CS goes to CE1: /dev/spidev0.1.
+DEFAULT_RTD_SPI_BUS = 0
+DEFAULT_RTD_SPI_DEVICE = 1
+DEFAULT_RTD_WIRES = 3            # Adafruit #3290 is a 3-wire probe
+DEFAULT_RTD_FILTER_HZ = 60       # mains notch; 60 Hz also converts faster
+DEFAULT_RTD_POLL_SECONDS = 1.0
+DEFAULT_RTD_DEVICE_ID = 30
+DEFAULT_RTD_HEARTBEAT_SECONDS = 10
+DEFAULT_CSV_PATH_RTD = "rtd_data.csv"
+
 # How often the CAN transmit thread wakes up to check for changes (seconds).
 # Pkt0 (power) is checked every tick; pkt1 (status) is throttled per-slot
 # to STATUS_MIN_INTERVAL_S — see _transmit_thread.
@@ -99,16 +112,19 @@ MAX_CAN_PACKETS_PER_FRAME = 4
 
 # send_hex priority values — lower number = served first when multiple
 # threads are waiting on PriorityLockedTransport. BMV carries the peak
-# current draw we care about most; BMS carries SOC; the MPPTs are the
-# bulk of the traffic and go last.
+# current draw we care about most; BMS carries SOC; the RTD is one small
+# packet every few seconds; the MPPTs are the bulk of the traffic and go
+# last.
 PRIORITY_BMV = 0
 PRIORITY_BMS = 5
+PRIORITY_RTD = 7
 PRIORITY_CAN = 10
 
 # How often a cached sender's transmit thread wakes to check the latest
 # cached reading and decide whether to send.
 BMV_SAMPLE_INTERVAL = 0.1
 BMS_SAMPLE_INTERVAL = 0.25
+RTD_SAMPLE_INTERVAL = 0.25
 
 # Discharge current magnitude (amps) that starts the drive elapsed timer.
 # Overridable with --drive-start-current-a.
@@ -866,10 +882,48 @@ def build_can_sender_components(args):
     }
 
 
+def build_rtd_sender_components(args):
+    """Motor-temperature PT100 on a MAX31865 over SPI: one conversion per poll."""
+    from RTD.max31865_reader import MAX31865Reader
+    from RTD.rtd_normalizer import normalize_rtd_frame
+
+    reader = MAX31865Reader(
+        bus=args.rtd_spi_bus,
+        device=args.rtd_spi_device,
+        wires=args.rtd_wires,
+        filter_hz=args.rtd_filter_hz,
+        poll_interval=args.rtd_poll_seconds,
+    )
+    policy = GenericTransmitPolicy(
+        deltas={
+            "motor_temp_c": args.rtd_temp_delta_c,
+            # A fault appearing or clearing is news.
+            "fault":  1,
+        },
+        event_type_change=EventType.DELTA_UPDATE,
+        event_type_heartbeat=EventType.HEARTBEAT,
+        heartbeat_seconds=args.rtd_heartbeat_seconds,
+    )
+
+    return {
+        "reader": reader,
+        "normalizer": normalize_rtd_frame,
+        "policy": policy,
+        "packet_builder": build_rtd_packet,
+        "device_id": args.rtd_device_id,
+        "log_prefix": "rtd",
+        "reader_sink": lambda r: write_telemetry_csv(args.csv_path_rtd, r),
+        "stats": TxStats("rtd"),
+        "priority": PRIORITY_RTD,
+        "sample_interval": RTD_SAMPLE_INTERVAL,
+    }
+
+
 # name -> (component builder, run function)
 SOURCES = {
     "bmv": (build_bmv_sender_components, run_cached_sender),
     "bms": (build_bms_sender_components, run_cached_sender),
+    "rtd": (build_rtd_sender_components, run_cached_sender),
     "can": (build_can_sender_components, run_can_sender),
 }
 
@@ -943,6 +997,25 @@ def build_parser():
                         help="MPPT: battery voltage change to trigger transmit (V)")
     parser.add_argument("--mppt-heartbeat-seconds", type=int, default=DEFAULT_MPPT_HEARTBEAT_SECONDS)
 
+    # RTD (PT100 on a MAX31865, SPI)
+    parser.add_argument("--rtd-spi-bus", type=int, default=DEFAULT_RTD_SPI_BUS,
+                        help="SPI bus of the MAX31865 (/dev/spidev<bus>.<device>)")
+    parser.add_argument("--rtd-spi-device", type=int, default=DEFAULT_RTD_SPI_DEVICE,
+                        help="SPI chip select of the MAX31865 (1 = CE1; CE0 is the CAN hat)")
+    parser.add_argument("--rtd-wires", type=int, choices=(2, 3, 4), default=DEFAULT_RTD_WIRES,
+                        help="RTD probe wiring (must match the board's solder jumpers)")
+    parser.add_argument("--rtd-filter-hz", type=int, choices=(50, 60), default=DEFAULT_RTD_FILTER_HZ,
+                        help="MAX31865 noise-rejection filter")
+    parser.add_argument("--rtd-poll-seconds", type=float, default=DEFAULT_RTD_POLL_SECONDS,
+                        help="Seconds between temperature conversions")
+    parser.add_argument("--rtd-device-id", type=int, default=DEFAULT_RTD_DEVICE_ID,
+                        help="Telemetry device id for the RTD")
+    parser.add_argument("--csv-path-rtd", default=DEFAULT_CSV_PATH_RTD,
+                        help="CSV output path for RTD data")
+    parser.add_argument("--rtd-temp-delta-c", type=float, default=0.5,
+                        help="RTD: motor temperature change to trigger transmit (C)")
+    parser.add_argument("--rtd-heartbeat-seconds", type=int, default=DEFAULT_RTD_HEARTBEAT_SECONDS)
+
     # LoRa (radio settings default to LORA/radio_config.py, shared with the receiver)
     parser.add_argument("--lora-port", default=DEFAULT_LORA_PORT, help="LoRa modem serial device")
     parser.add_argument("--lora-baud", type=int, default=DEFAULT_LORA_BAUD, help="LoRa modem baud rate")
@@ -978,8 +1051,9 @@ def _open_sources(args):
                   f"{traceback.format_exc()}", flush=True)
     if not opened:
         raise RuntimeError(
-            "No telemetry sources available. Check --bmv-port, --bms-port "
-            "and --can-interface, or run with an explicit --device."
+            "No telemetry sources available. Check --bmv-port, --bms-port, "
+            "--can-interface and --rtd-spi-device, or run with an explicit "
+            "--device."
         )
     return opened
 
