@@ -16,6 +16,7 @@ receiver:
 		--hidden-import CAN.can_handler \
 		--hidden-import LORA.radio_config \
 		--hidden-import LORA.lora_transport \
+		--hidden-import RTD.rtd_handler \
 		--hidden-import storage.csv_sink \
 		--hidden-import storage.event_csv_sink \
 		--hidden-import telemetry_packet \
@@ -36,6 +37,9 @@ sender:
 		--hidden-import CAN.can_reader \
 		--hidden-import LORA.radio_config \
 		--hidden-import LORA.lora_transport \
+		--hidden-import RTD.max31865_reader \
+		--hidden-import RTD.rtd_normalizer \
+		--hidden-import spidev \
 		--hidden-import storage.csv_sink \
 		--hidden-import telemetry_packet \
 		--hidden-import transmit_policy \

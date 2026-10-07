@@ -33,6 +33,9 @@ CSV_COLUMNS = {
         # Raw registers not identified yet (see BMS/bms_normalizer.py).
         *(f"reg_{addr}" for addr in UNIDENTIFIED_REGS),
     ),
+    "rtd": (
+        "motor_temp_c", "resistance_ohm", "raw_code", "fault", "fault_name",
+    ),
 }
 
 
