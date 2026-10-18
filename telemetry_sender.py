@@ -4,8 +4,9 @@
 Sources (each optional; `--device all` runs whichever can be opened):
     bmv  Victron BMV-712 shunt        VE.Direct over USB
     bms  EG4 LL-S battery BMS         Modbus RTU over RS485 (RJ45 -> USB)
-    can  TPEE SEC-B175 MPPTs          CAN bus (SocketCAN)
-    rtd  motor PT100 on a MAX31865    SPI (spidev, CE1)
+    rtd  motor PT100 on a MAX31865    SPI (spidev, CE0)
+    can  TPEE SEC-B175 MPPTs          CAN bus (SocketCAN) -- legacy, only
+                                      with an explicit `--device can`
 
 All sources share one LoRa modem through PriorityLockedTransport:
 BMV > BMS > RTD > CAN.
@@ -86,10 +87,10 @@ DEFAULT_MPPT_DEVICE_ID = 1
 DEFAULT_MPPT_HEARTBEAT_SECONDS = 5
 DEFAULT_CSV_PATH_MPPT = "mppt_data.csv"
 
-# RTD (motor-temperature PT100 on an Adafruit MAX31865 board). The MCP2515 CAN hat owns SPI0
-# CE0 (spidev0.0), so the MAX31865's CS goes to CE1: /dev/spidev0.1.
+# RTD (motor-temperature PT100 on an Adafruit MAX31865 board). With the
+# MCP2515 CAN hat gone, the MAX31865's CS is on CE0: /dev/spidev0.0.
 DEFAULT_RTD_SPI_BUS = 0
-DEFAULT_RTD_SPI_DEVICE = 1
+DEFAULT_RTD_SPI_DEVICE = 0
 DEFAULT_RTD_WIRES = 3            # Adafruit #3290 is a 3-wire probe
 DEFAULT_RTD_FILTER_HZ = 60       # mains notch; 60 Hz also converts faster
 DEFAULT_RTD_POLL_SECONDS = 1.0
@@ -927,6 +928,11 @@ SOURCES = {
     "can": (build_can_sender_components, run_can_sender),
 }
 
+# What `--device all` opens. CAN is left out: nothing on the car uses the
+# bus any more and the CAN hat has been removed, so it's only tried with an
+# explicit `--device can`.
+ALL_SOURCES = ("bmv", "bms", "rtd")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -936,7 +942,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description="On-car telemetry sender")
     parser.add_argument("--device", choices=(*SOURCES, "all"), default=DEFAULT_DEVICE,
                         help="Which source to run; 'all' runs every source "
-                             "whose hardware can be opened")
+                             "except can whose hardware can be opened")
     parser.add_argument("--transport", choices=("lora",), default=DEFAULT_TRANSPORT)
     parser.add_argument("--dry-run", action="store_true",
                         help="Read sources and build packets, but print them "
@@ -1001,7 +1007,7 @@ def build_parser():
     parser.add_argument("--rtd-spi-bus", type=int, default=DEFAULT_RTD_SPI_BUS,
                         help="SPI bus of the MAX31865 (/dev/spidev<bus>.<device>)")
     parser.add_argument("--rtd-spi-device", type=int, default=DEFAULT_RTD_SPI_DEVICE,
-                        help="SPI chip select of the MAX31865 (1 = CE1; CE0 is the CAN hat)")
+                        help="SPI chip select of the MAX31865 (0 = CE0, 1 = CE1)")
     parser.add_argument("--rtd-wires", type=int, choices=(2, 3, 4), default=DEFAULT_RTD_WIRES,
                         help="RTD probe wiring (must match the board's solder jumpers)")
     parser.add_argument("--rtd-filter-hz", type=int, choices=(50, 60), default=DEFAULT_RTD_FILTER_HZ,
@@ -1038,7 +1044,7 @@ def build_parser():
 def _open_sources(args):
     """Build every requested source. With --device all a source whose
     hardware is missing is skipped; with a single --device it's fatal."""
-    names = list(SOURCES) if args.device == "all" else [args.device]
+    names = list(ALL_SOURCES) if args.device == "all" else [args.device]
     opened = []
     for name in names:
         builder, run = SOURCES[name]
@@ -1051,9 +1057,8 @@ def _open_sources(args):
                   f"{traceback.format_exc()}", flush=True)
     if not opened:
         raise RuntimeError(
-            "No telemetry sources available. Check --bmv-port, --bms-port, "
-            "--can-interface and --rtd-spi-device, or run with an explicit "
-            "--device."
+            "No telemetry sources available. Check --bmv-port, --bms-port "
+            "and --rtd-spi-device, or run with an explicit --device."
         )
     return opened
 

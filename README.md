@@ -10,7 +10,7 @@ flowchart LR
         BMV["Victron BMV-712 shunt<br/>VE.Direct USB"] --> S
         BMS["EG4 LL-S battery BMS<br/>RS485 / Modbus RTU via USB"] --> S
         MPPT["6x TPEE SEC-B175 MPPTs<br/>CAN bus (can0)"] --> S
-        RTD["Motor PT100 probe + MAX31865<br/>SPI (spidev0.1)"] --> S
+        RTD["Motor PT100 probe + MAX31865<br/>SPI (spidev0.0)"] --> S
         S["normalize, decide what to send,<br/>build packets"] --> CSV1[("on-car CSVs")]
         S --> TX["LoRa modem (LA66)"]
     end
@@ -26,8 +26,8 @@ flowchart LR
 |---|---|---|---|---|
 | `bmv` | Victron BMV-712 battery shunt | VE.Direct USB cable | `BMV/` | 1 |
 | `bms` | EG4 LL-S battery BMS | Battery RJ45 RS485 port → USB-RS485 adapter (Modbus RTU, 9600 8N1) | `BMS/` | 20 |
-| `can` | 6× TPEE SEC-B175 MPPTs | CAN bus through an MCP2515 CAN hat (SocketCAN `can0`) | `CAN/` | 1–6 (one per board) |
-| `rtd` | Motor temperature: PT100 3-wire probe (Adafruit #3290) on a MAX31865 board (Adafruit #3328) | SPI0, chip select CE1 (`/dev/spidev0.1`) | `RTD/` | 30 |
+| `rtd` | Motor temperature: PT100 3-wire probe (Adafruit #3290) on a MAX31865 board (Adafruit #3328) | SPI0, chip select CE0 (`/dev/spidev0.0`) | `RTD/` | 30 |
+| `can` | 6× TPEE SEC-B175 MPPTs (legacy: no longer on the car) | CAN bus through an MCP2515 CAN hat (SocketCAN `can0`) | `CAN/` | 1–6 (one per board) |
 
 > **Update the car and the ground station together.** Both ends use the packet format in `telemetry_packet.py`. The receiver rejects packets whose protocol version doesn't match its own (currently **v3**).
 
@@ -123,7 +123,9 @@ Plug in the Victron VE.Direct USB cable. The default port in `telemetry_sender.p
    - If discharge shows as a **positive** current, set `CURRENT_SIGN = -1`. The rest of the system expects discharge to be negative.
    - While running, the normalizer warns in the log if SOC reads over 100 % or the sum of the cells differs from the pack voltage by more than 1 V. Either warning means the register map is wrong.
 
-### MPPTs (CAN bus)
+### MPPTs (CAN bus, legacy)
+Nothing on the car uses CAN any more, so `--device all` skips it. These steps only apply if you run `--device can` with the hat fitted.
+
 1. Enable the MCP2515 CAN hat in `/boot/firmware/config.txt`:
    ```
    dtparam=spi=on
@@ -146,7 +148,7 @@ The motor temperature probe is an Adafruit #3290 PT100, which is **3-wire**, rea
    - Solder closed the jumper labelled **2/3 Wire**.
    - Cut the trace connecting the left side of the 2-way jumper right above Rref, then solder closed its right side, labelled **3**.
 2. **Connect the probe.** The two wires of the same colour go in the right-hand terminal blocks, **F+** and **RTD+**; it doesn't matter which is which. The third wire goes to **RTD−/F−** on the left.
-3. **Connect the board to the Pi.** The CAN hat already uses SPI chip select CE0, so the MAX31865 uses **CE1**:
+3. **Connect the board to the Pi** on SPI0, chip select **CE0**:
 
    | MAX31865 | Pi pin | Pi signal |
    |---|---|---|
@@ -155,17 +157,15 @@ The motor temperature probe is an Adafruit #3290 PT100, which is **3-wire**, rea
    | CLK | 23 | GPIO11 / SCLK |
    | SDO | 21 | GPIO9 / MISO |
    | SDI | 19 | GPIO10 / MOSI |
-   | CS | 26 | GPIO7 / CE1 |
-
-   These pins are shared with the CAN hat (CS excepted), so you need a hat with a pass-through header or a stacking header. If your CAN hat is a dual-channel model that also uses CE1, wire CS to a free chip select instead and pass `--rtd-spi-device`.
+   | CS | 24 | GPIO8 / CE0 |
 
    **Mount the MAX31865 board next to the Pi, not at the motor.** Keep the six SPI wires short (under about 30 cm). SPI isn't designed to run any distance, and the motor controller's switching noise corrupts long SPI lines. Bridge the distance with the probe's leads instead: if the 1 m lead doesn't reach, extend all three wires with the **same gauge and the same length**. 3-wire compensation assumes equal lead resistance. Twist the three wires together, use shielded cable with the shield grounded at the board end only, and route it away from the motor phase cables.
-4. **SPI** is already enabled by `dtparam=spi=on` (see the MPPT section). `ls /dev/spidev*` should list `/dev/spidev0.1`. The mcp2515 overlay takes over CE0, so `spidev0.0` won't be listed; that's expected.
+4. **Enable SPI** with `dtparam=spi=on` in `/boot/firmware/config.txt` (or `sudo raspi-config` → Interface Options → SPI), and make sure there's **no** `dtoverlay=mcp2515-can0` line. That overlay takes over CE0, and then `spidev0.0` doesn't exist. Reboot, then `ls /dev/spidev*` should list `/dev/spidev0.0`. If CS is wired to CE1 (pin 26) instead, pass `--rtd-spi-device 1`.
 5. **Check it:**
    ```bash
    python3 telemetry_sender.py --device rtd --dry-run
    ```
-   At startup the sender writes a test pattern to the MAX31865 and reads it back. If the board doesn't answer, it reports `No MAX31865 answering on /dev/spidev0.1` and (with `--device all`) skips the RTD. At room temperature, expect about 108–110 Ω and 20–25 °C.
+   At startup the sender writes a test pattern to the MAX31865 and reads it back. If the board doesn't answer, it reports `No MAX31865 answering on /dev/spidev0.0` and (with `--device all`) skips the RTD. At room temperature, expect about 108–110 Ω and 20–25 °C.
 
 Options: `--rtd-wires 2|3|4` must match the jumpers, `--rtd-filter-hz 50|60` (default 60) and `--rtd-poll-seconds` (default 1). The resistor values `R_REF` (430 Ω) and `R_NOMINAL` (100 Ω) are at the top of `RTD/rtd_normalizer.py`. Change them if you switch to the PT1000 version of the board (`R_REF = 4300`, `R_NOMINAL = 1000`).
 
@@ -177,7 +177,7 @@ Options: `--rtd-wires 2|3|4` must match the jumpers, `--rtd-filter-hz 50|60` (de
 ```bash
 python3 telemetry_sender.py
 ```
-By default (`--device all`) it opens every device it can find and skips any whose hardware is missing, logging why. To run one device on its own:
+By default (`--device all`) it opens the BMV, BMS and RTD, and skips any whose hardware is missing, logging why. CAN isn't part of `all`; it only runs with `--device can`. To run one device on its own:
 ```bash
 python3 telemetry_sender.py --device bmv
 python3 telemetry_sender.py --device bms --bms-address 1
@@ -318,9 +318,8 @@ python3 LORA/sender.py --port /dev/serial/by-id/<lora-modem> --text hello
 | `[bms] WARNING: cell sum ... != pack voltage` or `SOC reads 150 %` | The register map is wrong for this battery firmware. Check it with `bms_probe` and fix `REG`. |
 | `[bmv-reader] Checksum FAILED` now and then | Electrical noise on the VE.Direct cable; bad blocks are dropped. If it happens constantly, check the cable. |
 | `[bmv-reader] Non-tab-delimited line` | Wrong port or baud rate for the BMV. |
-| `[all] CAN unavailable, skipping` | `can0` isn't up; run the `ip link` command above. |
 | An MPPT never appears | Its ID isn't in `MPPT_EFFECTIVE_IDS`; check `candump can0`. |
-| `No MAX31865 answering on /dev/spidev0.1` | SPI not enabled, CS not on pin 26 (CE1), SDI/SDO swapped, or no 3.3 V. `ls /dev/spidev*` should list `spidev0.1`. |
+| `No MAX31865 answering on /dev/spidev0.0` or `No such file or directory` for the spidev | SPI not enabled, the mcp2515 overlay still in `config.txt`, CS not on pin 24 (CE0), SDI/SDO swapped, or no 3.3 V. `ls /dev/spidev*` should list `spidev0.0`. |
 | RTD sends only `fault` (`rtd_high`, `refin_low`, ...) | Probe unplugged or a loose terminal, or the jumpers don't match `--rtd-wires`. |
 | RTD temperature is off by several °C | The board is jumpered for 2/4-wire with a 3-wire probe (or the reverse), or `R_REF` doesn't match the board. |
 | Receiver prints `Unsupported protocol version` | One end wasn't updated; deploy the same code to both. |
