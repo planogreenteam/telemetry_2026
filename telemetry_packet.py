@@ -190,6 +190,9 @@ BMS_FIELD_LAYOUT = (
 # motor_temp_c is i16 x100 (0.01 C; +/-327 C is well past any motor limit);
 # resistance_ohm is u16 x100 (a PT100 is ~390 ohm at its 850 C limit). A
 # reading with a sensor fault carries only the fault byte.
+#
+# motor_temp_f is not on the wire: decode_packet() derives it from
+# motor_temp_c, so Fahrenheit costs no airtime (see DERIVED_FIELDS).
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RTDField(IntEnum):
@@ -213,9 +216,24 @@ _LAYOUTS = {
 }
 
 
+# Fields the decoder computes from wire fields, per msg_type:
+# (name, source wire field, function of the source value).
+DERIVED_FIELDS = {
+    MsgType.RTD: (
+        ("motor_temp_f", "motor_temp_c", lambda c: round(c * 9 / 5 + 32, 2)),
+    ),
+}
+
+
 def layout_field_names(msg_type):
     """Field names carried on the wire for msg_type, in layout order."""
     return tuple(f.name for f in _LAYOUTS[MsgType(msg_type)])
+
+
+def decoded_field_names(msg_type):
+    """Every field a decoded msg_type packet can have: wire + derived."""
+    derived = DERIVED_FIELDS.get(MsgType(msg_type), ())
+    return layout_field_names(msg_type) + tuple(name for name, _, _ in derived)
 
 
 def crc16(data: bytes) -> int:
@@ -458,4 +476,8 @@ def decode_payload(msg_type, field_mask, payload):
 
     if offset != len(payload):
         raise ValueError("Payload has unexpected trailing bytes")
+
+    for name, source, derive in DERIVED_FIELDS.get(mt, ()):
+        if source in fields:
+            fields[name] = derive(fields[source])
     return fields

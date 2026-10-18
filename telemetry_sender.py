@@ -1050,10 +1050,18 @@ def _open_sources(args):
         builder, run = SOURCES[name]
         try:
             opened.append((name, builder(args), run))
+        except (OSError, RuntimeError) as exc:
+            # Missing hardware: serial port not there (SerialException is
+            # an OSError), no spidev node, MAX31865 not answering. Expected
+            # when a device is unplugged, so one line, not a traceback.
+            if args.device != "all":
+                raise
+            print(f"[all] {name.upper()} unavailable, skipping: {exc}",
+                  flush=True)
         except Exception:
             if args.device != "all":
                 raise
-            print(f"[all] {name.upper()} unavailable, skipping:\n"
+            print(f"[all] {name.upper()} failed to start, skipping:\n"
                   f"{traceback.format_exc()}", flush=True)
     if not opened:
         raise RuntimeError(

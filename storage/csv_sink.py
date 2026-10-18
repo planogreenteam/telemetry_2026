@@ -34,7 +34,8 @@ CSV_COLUMNS = {
         *(f"reg_{addr}" for addr in UNIDENTIFIED_REGS),
     ),
     "rtd": (
-        "motor_temp_c", "resistance_ohm", "raw_code", "fault", "fault_name",
+        "motor_temp_c", "motor_temp_f", "resistance_ohm", "raw_code", "fault",
+        "fault_name",
     ),
 }
 

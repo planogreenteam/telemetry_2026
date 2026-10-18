@@ -258,7 +258,7 @@ Fields carried over the radio:
 | BMV | voltage_mv, current_ma, power_w, charge_state (SOC %), alarm, elapsed_s, peak_current_ma |
 | BMS | battery_voltage_v, battery_current_a, soc_pct, soh_pct, cell_v_max_mv, cell_v_min_mv, cell_max_idx, cell_min_idx, cell_sum_v, temp_max_c, remaining_ah, elapsed_s (the layout also has slots for temp_avg_c and the warning/protection/error flags, which are sent once their registers are identified) |
 | MPPT | pv_voltage_v, pv_current_a, pv_power_w, battery_voltage_v, battery_current_a, mode, fault, enabled, ambient_temp_c, heatsink_temp_c, mppt_index, packet_id |
-| RTD | motor_temp_c, resistance_ohm, fault (a reading with a fault carries only `fault`, so a broken probe never shows up as a believable temperature) |
+| RTD | motor_temp_c, resistance_ohm, fault (a reading with a fault carries only `fault`, so a broken probe never shows up as a believable temperature). The receiver adds `motor_temp_f`, computed from `motor_temp_c`, so Fahrenheit isn't sent over the radio. |
 
 If you add or change a field, update its layout in `telemetry_packet.py` and bump `PROTOCOL_VERSION`. Then deploy to both ends.
 
@@ -295,7 +295,7 @@ InfluxDB writes run on a background thread. If InfluxDB is slow or down, the rec
 
 **Create the `RTD-data` bucket in InfluxDB** (or point `--influx-bucket-rtd` at an existing one) before running the receiver. Otherwise the RTD writes fail, though CSV still records them.
 
-Import `GrafanaScript.JSON` into Grafana for the team dashboard. The dashboard doesn't have BMS or RTD panels yet; add them from the `BMS` `msg_type` (for example `fields_soc_pct`) and the `RTD` `msg_type` (`fields_motor_temp_c`).
+Import `GrafanaScript.JSON` into Grafana for the team dashboard. The dashboard doesn't have BMS or RTD panels yet; add them from the `BMS` `msg_type` (for example `fields_soc_pct`) and the `RTD` `msg_type` (`fields_motor_temp_c`, or `fields_motor_temp_f` for Fahrenheit).
 
 ---
 
