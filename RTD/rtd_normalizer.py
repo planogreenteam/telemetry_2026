@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn a raw MAX31865 reading into resistance (ohms) and motor temperature (C).
+"""Turn a raw MAX31865 reading into resistance (ohms) and motor temperature (C and F).
 
     resistance = raw / 32768 * R_REF
 
@@ -71,7 +71,9 @@ def normalize_rtd_frame(raw_frame, device_id):
     if not fault:
         resistance = resistance_from_raw(raw)
         fields["resistance_ohm"] = round(resistance, 3)
-        fields["motor_temp_c"] = round(temperature_from_resistance(resistance), 2)
+        temp_c = temperature_from_resistance(resistance)
+        fields["motor_temp_c"] = round(temp_c, 2)
+        fields["motor_temp_f"] = round(temp_c * 9 / 5 + 32, 2)
 
     return {
         "device_type": "rtd",

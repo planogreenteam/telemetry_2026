@@ -4,7 +4,7 @@
 from datetime import datetime, timezone
 
 from storage.csv_sink import open_csv_writer
-from telemetry_packet import MsgType, layout_field_names
+from telemetry_packet import MsgType, decoded_field_names
 
 
 _META_HEADERS = (
@@ -20,7 +20,7 @@ _META_HEADERS = (
 def _all_field_names():
     names = []
     for msg_type in MsgType:
-        for name in layout_field_names(msg_type):
+        for name in decoded_field_names(msg_type):
             if name not in names:
                 names.append(name)
     return tuple(names)
