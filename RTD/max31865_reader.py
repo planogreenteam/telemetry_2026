@@ -13,13 +13,15 @@ mode so the bias current doesn't self-heat the probe between polls, the
 same approach Adafruit's driver takes.
 
 Only the `spidev` package is needed: the register protocol is a handful of
-byte transfers. The MCP2515 CAN hat already owns SPI0 CE0, so the MAX31865
-sits on CE1 (/dev/spidev0.1, GPIO7 / pin 26) by default.
+byte transfers. The MAX31865 sits on CE0 (/dev/spidev0.0, GPIO8 / pin 24) by
+default.
 
 If the board never answers (RuntimeError at startup), in order of
 likelihood:
   - SPI not enabled (`dtparam=spi=on` in /boot/firmware/config.txt),
-  - CS wired to the wrong pin for --rtd-spi-device (CE1 = pin 26),
+  - CS wired to the wrong pin for --rtd-spi-device (CE0 = pin 24),
+  - the mcp2515 CAN overlay still in config.txt (it claims CE0, so
+    /dev/spidev0.0 doesn't exist),
   - SDI/SDO swapped (SDI is the board's input: Pi MOSI -> SDI, SDO -> MISO),
   - no 3.3 V / GND to the board.
 """
@@ -60,7 +62,7 @@ DIAGNOSTIC_INTERVAL = 5.0
 
 
 class MAX31865Reader:
-    def __init__(self, bus=0, device=1, wires=3, filter_hz=60,
+    def __init__(self, bus=0, device=0, wires=3, filter_hz=60,
                  poll_interval=1.0, speed_hz=500_000):
         if wires not in (2, 3, 4):
             raise ValueError(f"wires must be 2, 3 or 4, not {wires}")
